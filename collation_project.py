@@ -13,6 +13,7 @@ from collation_rules import CollationRuleLibrary, CollationType
 from workflow_engine import WorkflowEngine, Role, DoubtStatus, ReviewAction, DoubtRecord
 from doubt_detector import DoubtDetector, DetectionSummary
 from audit_trail import AuditTrail, OperationType
+from citation_analyzer import CitationAnalyzer, CitationType as CitationTypeEnum, CitationDetectionSummary
 
 
 class ProjectStatus(str, Enum):
@@ -61,13 +62,15 @@ class CollationProject:
                  rule_library: Optional[CollationRuleLibrary] = None,
                  workflow_engine: Optional[WorkflowEngine] = None,
                  doubt_detector: Optional[DoubtDetector] = None,
-                 audit_trail: Optional[AuditTrail] = None):
+                 audit_trail: Optional[AuditTrail] = None,
+                 citation_analyzer: Optional[CitationAnalyzer] = None):
         self.config = config
         self.analyzer = analyzer
         self.rule_library = rule_library or CollationRuleLibrary()
         self.audit_trail = audit_trail or AuditTrail()
         self.workflow_engine = workflow_engine or WorkflowEngine(self.audit_trail)
         self.doubt_detector = doubt_detector or DoubtDetector(self.rule_library, self.workflow_engine)
+        self.citation_analyzer = citation_analyzer or CitationAnalyzer(analyzer)
         self._counter = 0
 
         if not config.enabled_rule_ids:
@@ -88,6 +91,7 @@ class CollationProject:
         if analyzer.book_name != self.book_name:
             raise ValueError(f"分析器书名【{analyzer.book_name}】与项目书名【{self.book_name}】不匹配")
         self.analyzer = analyzer
+        self.citation_analyzer.set_analyzer(analyzer)
         self.config.volumes = sorted(set(self.config.volumes) | set(analyzer.volumes))
         self.config.copy_batches = sorted(set(self.config.copy_batches) | set(analyzer.copy_batches))
 
@@ -160,7 +164,13 @@ class CollationProject:
             'total_records': len(self.analyzer.df) if self.analyzer else 0,
             'total_members': len(self.config.assigned_users),
             'by_type': {},
-            'by_status': {}
+            'by_status': {},
+            'total_citations': 0,
+            'pending_citations': 0,
+            'confirmed_citations': 0,
+            'rejected_citations': 0,
+            'invalid_citations': 0,
+            'misquote_citations': 0
         }
         doubts = self.workflow_engine.get_all_doubts(self.project_id)
         for d in doubts:
@@ -181,6 +191,13 @@ class CollationProject:
                 stats['resolved_doubts'] += 1
             elif d.status == DoubtStatus.INVALID:
                 stats['invalid_doubts'] += 1
+        cite_stats = self.workflow_engine.get_citation_statistics(self.project_id)
+        stats['total_citations'] = cite_stats.get('total', 0)
+        stats['pending_citations'] = cite_stats.get('pending', 0)
+        stats['confirmed_citations'] = cite_stats.get('confirmed', 0)
+        stats['rejected_citations'] = cite_stats.get('rejected', 0)
+        stats['invalid_citations'] = cite_stats.get('invalidated', 0)
+        stats['misquote_citations'] = cite_stats.get('misquote_count', 0)
         return stats
 
     def assign_user(self, admin_user: str, username: str, role: Role):
@@ -281,7 +298,7 @@ class CollationProject:
         new_row = self.analyzer.df.iloc[index].to_dict()
         changed_cols = [k for k in old_row if old_row[k] != new_row[k]]
 
-        invalidated_ids = self.workflow_engine.invalidate_doubts_by_data_change(
+        invalidated_doubt_ids = self.workflow_engine.invalidate_doubts_by_data_change(
             operator=operator,
             project_id=self.project_id,
             volume=volume,
@@ -290,6 +307,17 @@ class CollationProject:
             reason=f"原始数据被修改: {changed_cols}"
         )
 
+        invalidated_citation_ids = self.workflow_engine.invalidate_citations_by_data_change(
+            operator=operator,
+            project_id=self.project_id,
+            volume=volume,
+            paragraph=paragraph,
+            copy_batch=copy_batch,
+            reason=f"原始数据被修改: {changed_cols}"
+        )
+
+        all_invalidated_ids = invalidated_doubt_ids + invalidated_citation_ids
+
         self.audit_trail.log(
             operation_type=OperationType.DATA_UPDATE,
             operator=operator,
@@ -297,13 +325,13 @@ class CollationProject:
             project_id=self.project_id,
             target_id=f'record-{index}',
             target_type='DataRecord',
-            description=f"修改数据行{index + 2}的【{column}】，导致{len(invalidated_ids)}个关联疑点失效",
+            description=f"修改数据行{index + 2}的【{column}】，导致{len(invalidated_doubt_ids)}个疑点、{len(invalidated_citation_ids)}个引文溯源失效",
             old_value=old_row,
             new_value=new_row,
-            extra={'invalidated_doubts': invalidated_ids}
+            extra={'invalidated_doubts': invalidated_doubt_ids, 'invalidated_citations': invalidated_citation_ids}
         )
 
-        return True, "", invalidated_ids
+        return True, "", all_invalidated_ids
 
     def delete_analyzer_record(self, operator: str, index: int) -> Tuple[bool, List[str]]:
         self.workflow_engine.permission_manager.check_permission(operator, 'edit_data')
@@ -317,7 +345,7 @@ class CollationProject:
         copy_batch = str(row['抄本批次'])
         old_row = row.to_dict()
 
-        invalidated_ids = self.workflow_engine.invalidate_doubts_by_data_change(
+        invalidated_doubt_ids = self.workflow_engine.invalidate_doubts_by_data_change(
             operator=operator,
             project_id=self.project_id,
             volume=volume,
@@ -325,6 +353,17 @@ class CollationProject:
             copy_batch=copy_batch,
             reason=f"关联数据行被删除"
         )
+
+        invalidated_citation_ids = self.workflow_engine.invalidate_citations_by_data_change(
+            operator=operator,
+            project_id=self.project_id,
+            volume=volume,
+            paragraph=paragraph,
+            copy_batch=copy_batch,
+            reason=f"关联数据行被删除"
+        )
+
+        all_invalidated_ids = invalidated_doubt_ids + invalidated_citation_ids
 
         success = self.analyzer.delete_record(index)
         if success:
@@ -335,12 +374,12 @@ class CollationProject:
                 project_id=self.project_id,
                 target_id=f'record-{index}',
                 target_type='DataRecord',
-                description=f"删除数据行{index + 2}，导致{len(invalidated_ids)}个关联疑点失效",
+                description=f"删除数据行{index + 2}，导致{len(invalidated_doubt_ids)}个疑点、{len(invalidated_citation_ids)}个引文溯源失效",
                 old_value=old_row,
-                extra={'invalidated_doubts': invalidated_ids}
+                extra={'invalidated_doubts': invalidated_doubt_ids, 'invalidated_citations': invalidated_citation_ids}
             )
 
-        return success, invalidated_ids
+        return success, all_invalidated_ids
 
     def get_doubts(self,
                    status: Optional[DoubtStatus] = None,
@@ -369,6 +408,67 @@ class CollationProject:
 
     def reactivate_doubt(self, operator: str, doubt_id: str) -> DoubtRecord:
         return self.workflow_engine.reactivate_doubt(operator, doubt_id)
+
+    def run_citation_detection(self,
+                                  operator: str,
+                                  volume: Optional[int] = None,
+                                  copy_batch: Optional[str] = None,
+                                  detect_types: Optional[List[CitationTypeEnum]] = None) -> CitationDetectionSummary:
+        self.workflow_engine.permission_manager.check_permission(operator, 'detect_citations')
+        if not self.analyzer:
+            raise ValueError("项目尚未关联分析器，请先导入数据")
+        summary = self.citation_analyzer.detect_citations(
+            project_id=self.project_id,
+            operator=operator,
+            book_name=self.book_name,
+            volume=volume,
+            copy_batch=copy_batch,
+            detect_types=detect_types
+        )
+        created_count = 0
+        for record in self.citation_analyzer.get_pending_records():
+            try:
+                self.workflow_engine.create_citation(operator, record)
+                created_count += 1
+            except ValueError:
+                pass
+        summary.new_created = created_count
+        self.audit_trail.log(
+            operation_type=OperationType.CITATION_DETECT,
+            operator=operator,
+            operator_role=self.workflow_engine.permission_manager.get_user_role(operator).value,
+            project_id=self.project_id,
+            target_type='CitationDetection',
+            description=f"引文检测完成: 检测到{summary.total_detected}条，新增{summary.new_created}条，跳过重复{summary.duplicates_skipped}条"
+        )
+        return summary
+
+    def get_citations(self,
+                       status=None,
+                       citation_type=None,
+                       volume: Optional[int] = None,
+                       copy_batch: Optional[str] = None):
+        return self.workflow_engine.get_citations_by_filters(
+            self.project_id, status, citation_type, volume, copy_batch
+        )
+
+    def get_all_citations(self):
+        return self.workflow_engine.get_all_citations(self.project_id)
+
+    def confirm_citation(self, reviewer: str, citation_id: str, source=None, note: str = ''):
+        return self.workflow_engine.confirm_citation(reviewer, citation_id, source, note)
+
+    def reject_citation(self, reviewer: str, citation_id: str, reason: str = ''):
+        return self.workflow_engine.reject_citation(reviewer, citation_id, reason)
+
+    def supplement_citation_source(self, operator: str, citation_id: str, source, note: str = ''):
+        return self.workflow_engine.supplement_citation_source(operator, citation_id, source, note)
+
+    def reactivate_citation(self, operator: str, citation_id: str):
+        return self.workflow_engine.reactivate_citation(operator, citation_id)
+
+    def get_citation_statistics(self) -> Dict:
+        return self.workflow_engine.get_citation_statistics(self.project_id)
 
     def get_statistics(self) -> Dict:
         doubt_stats = self.workflow_engine.get_statistics(self.project_id)

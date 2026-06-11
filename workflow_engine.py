@@ -242,6 +242,36 @@ class PermissionManager:
             description='查看审计日志',
             roles={Role.ADMIN}
         ))
+        self.add_permission(Permission(
+            name='view_citations',
+            description='查看引文溯源',
+            roles={Role.ADMIN, Role.COLLATOR, Role.REVIEWER, Role.GUEST}
+        ))
+        self.add_permission(Permission(
+            name='detect_citations',
+            description='检测引文',
+            roles={Role.ADMIN, Role.COLLATOR}
+        ))
+        self.add_permission(Permission(
+            name='review_citation',
+            description='复核引文（确认/驳回/补充）',
+            roles={Role.ADMIN, Role.REVIEWER}
+        ))
+        self.add_permission(Permission(
+            name='create_citation',
+            description='创建引文记录',
+            roles={Role.ADMIN, Role.COLLATOR}
+        ))
+        self.add_permission(Permission(
+            name='edit_citation',
+            description='编辑引文记录',
+            roles={Role.ADMIN, Role.COLLATOR}
+        ))
+        self.add_permission(Permission(
+            name='export_citations',
+            description='导出引文溯源数据',
+            roles={Role.ADMIN, Role.COLLATOR, Role.REVIEWER}
+        ))
 
     def add_permission(self, permission: Permission):
         self._permissions[permission.name] = permission
@@ -278,6 +308,9 @@ class WorkflowEngine:
         self._unique_keys: Set[str] = set()
         self._comment_counter = 0
         self._doubt_counter = 0
+        self._citations: Dict[str, Any] = {}
+        self._citation_unique_keys: Set[str] = set()
+        self._citation_counter = 0
 
     def _generate_doubt_id(self, project_id: str) -> str:
         self._doubt_counter += 1
@@ -627,3 +660,237 @@ class WorkflowEngine:
         self._unique_keys.clear()
         self._comment_counter = 0
         self._doubt_counter = 0
+        self._citations.clear()
+        self._citation_unique_keys.clear()
+        self._citation_counter = 0
+
+    def _generate_citation_id(self, project_id: str) -> str:
+        from citation_analyzer import CitationType, CitationStatus
+        self._citation_counter += 1
+        timestamp = datetime.now().strftime('%Y%m%d')
+        return f'{project_id}-CIT-{timestamp}-{self._citation_counter:06d}'
+
+    def create_citation(self,
+                        creator: str,
+                        record: Any) -> Any:
+        from citation_analyzer import CitationAction, CitationStatus
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(creator, 'create_citation')
+        if record.unique_key in self._citation_unique_keys:
+            raise ValueError(f"同一引文线索已存在，不允许重复创建: {record.unique_key}")
+        record.citation_id = self._generate_citation_id(record.project_id)
+        record.created_by = creator
+        self._citations[record.citation_id] = record
+        self._citation_unique_keys.add(record.unique_key)
+        self.audit_trail.log(
+            operation_type=OperationType.CITATION_CREATE,
+            operator=creator,
+            operator_role=self.permission_manager.get_user_role(creator).value,
+            project_id=record.project_id,
+            target_id=record.citation_id,
+            target_type='CitationRecord',
+            description=f"创建引文【{record.citation_type.value}】: 第{record.volume}卷第{record.paragraph}段 ({record.copy_batch})",
+            new_value=record.to_dict()
+        )
+        return record
+
+    def get_citation(self, citation_id: str) -> Optional[Any]:
+        return self._citations.get(citation_id)
+
+    def get_all_citations(self, project_id: Optional[str] = None) -> List[Any]:
+        citations = list(self._citations.values())
+        if project_id:
+            citations = [c for c in citations if c.project_id == project_id]
+        return sorted(citations, key=lambda c: (c.volume, c.paragraph, c.created_at), reverse=True)
+
+    def get_citations_by_filters(self,
+                                  project_id: str,
+                                  status: Optional[Any] = None,
+                                  citation_type: Optional[Any] = None,
+                                  volume: Optional[int] = None,
+                                  copy_batch: Optional[str] = None) -> List[Any]:
+        from citation_analyzer import CitationStatus, CitationType
+        citations = self.get_all_citations(project_id)
+        filtered = []
+        for c in citations:
+            if status and c.status != status:
+                continue
+            if citation_type and c.citation_type != citation_type:
+                continue
+            if volume is not None and c.volume != volume:
+                continue
+            if copy_batch and c.copy_batch != copy_batch:
+                continue
+            filtered.append(c)
+        return filtered
+
+    def confirm_citation(self,
+                          reviewer: str,
+                          citation_id: str,
+                          source: Optional[Any] = None,
+                          note: str = '') -> Any:
+        from citation_analyzer import CitationAction, CitationStatus
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(reviewer, 'review_citation')
+        citation = self.get_citation(citation_id)
+        if not citation:
+            raise ValueError(f"引文记录不存在: {citation_id}")
+        if citation.status == CitationStatus.INVALIDATED:
+            raise ValueError(f"引文已失效，无法确认: {citation_id}")
+        old_status = citation.status
+        citation.confirm(reviewer, source, note)
+        self.audit_trail.log(
+            operation_type=OperationType.CITATION_REVIEW,
+            operator=reviewer,
+            operator_role=self.permission_manager.get_user_role(reviewer).value,
+            project_id=citation.project_id,
+            target_id=citation_id,
+            target_type='CitationRecord',
+            description=f"确认引文: {note[:50]}",
+            old_value={'status': old_status.value},
+            new_value={'status': CitationStatus.CONFIRMED.value}
+        )
+        return citation
+
+    def reject_citation(self,
+                         reviewer: str,
+                         citation_id: str,
+                         reason: str = '') -> Any:
+        from citation_analyzer import CitationStatus
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(reviewer, 'review_citation')
+        citation = self.get_citation(citation_id)
+        if not citation:
+            raise ValueError(f"引文记录不存在: {citation_id}")
+        if citation.status == CitationStatus.INVALIDATED:
+            raise ValueError(f"引文已失效，无法驳回: {citation_id}")
+        old_status = citation.status
+        citation.reject(reviewer, reason)
+        self.audit_trail.log(
+            operation_type=OperationType.CITATION_REVIEW,
+            operator=reviewer,
+            operator_role=self.permission_manager.get_user_role(reviewer).value,
+            project_id=citation.project_id,
+            target_id=citation_id,
+            target_type='CitationRecord',
+            description=f"驳回引文: {reason[:50]}",
+            old_value={'status': old_status.value},
+            new_value={'status': CitationStatus.REJECTED.value}
+        )
+        return citation
+
+    def supplement_citation_source(self,
+                                     operator: str,
+                                     citation_id: str,
+                                     source: Any,
+                                     note: str = '') -> Any:
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'review_citation')
+        citation = self.get_citation(citation_id)
+        if not citation:
+            raise ValueError(f"引文记录不存在: {citation_id}")
+        citation.supplement_source(operator, source, note)
+        self.audit_trail.log(
+            operation_type=OperationType.CITATION_UPDATE,
+            operator=operator,
+            operator_role=self.permission_manager.get_user_role(operator).value,
+            project_id=citation.project_id,
+            target_id=citation_id,
+            target_type='CitationRecord',
+            description=f"补充引文出处: {note[:50]}",
+            new_value={'source': source.to_dict()}
+        )
+        return citation
+
+    def reactivate_citation(self, operator: str, citation_id: str) -> Any:
+        from citation_analyzer import CitationStatus
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'edit_citation')
+        citation = self.get_citation(citation_id)
+        if not citation:
+            raise ValueError(f"引文记录不存在: {citation_id}")
+        if citation.unique_key in self._citation_unique_keys and citation.status != CitationStatus.INVALIDATED:
+            raise ValueError(f"相同引文线索已存在: {citation.unique_key}")
+        old_status = citation.status
+        citation.reactivate()
+        if citation.unique_key not in self._citation_unique_keys:
+            self._citation_unique_keys.add(citation.unique_key)
+        self.audit_trail.log(
+            operation_type=OperationType.CITATION_UPDATE,
+            operator=operator,
+            operator_role=self.permission_manager.get_user_role(operator).value,
+            project_id=citation.project_id,
+            target_id=citation_id,
+            target_type='CitationRecord',
+            description="重新激活已失效引文，进入待确认状态",
+            old_value={'status': old_status.value},
+            new_value={'status': CitationStatus.PENDING.value}
+        )
+        return citation
+
+    def invalidate_citations_by_data_change(self,
+                                             operator: str,
+                                             project_id: str,
+                                             volume: Optional[int] = None,
+                                             paragraph: Optional[int] = None,
+                                             copy_batch: Optional[str] = None,
+                                             reason: str = '关联数据已修改') -> List[str]:
+        from citation_analyzer import CitationStatus
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'edit_data')
+        invalidated_ids = []
+        for citation in self.get_all_citations(project_id):
+            if not citation.is_active:
+                continue
+            if volume is not None and citation.volume != volume:
+                continue
+            if paragraph is not None and citation.paragraph != paragraph:
+                continue
+            if copy_batch is not None and citation.copy_batch != copy_batch:
+                continue
+            self._citation_unique_keys.discard(citation.unique_key)
+            old_status = citation.status
+            citation.invalidate(reason)
+            invalidated_ids.append(citation.citation_id)
+            self.audit_trail.log(
+                operation_type=OperationType.CITATION_INVALIDATE,
+                operator=operator,
+                operator_role=self.permission_manager.get_user_role(operator).value,
+                project_id=project_id,
+                target_id=citation.citation_id,
+                target_type='CitationRecord',
+                description=f"引文因数据修改失效: {reason}",
+                old_value={'status': old_status.value},
+                new_value={'status': CitationStatus.INVALIDATED.value}
+            )
+        return invalidated_ids
+
+    def get_citation_statistics(self, project_id: Optional[str] = None) -> Dict[str, Any]:
+        from citation_analyzer import CitationStatus, CitationType
+        citations = self.get_all_citations(project_id)
+        stats = {
+            'total': len(citations),
+            'pending': 0,
+            'confirmed': 0,
+            'rejected': 0,
+            'invalidated': 0,
+            'by_type': {},
+            'by_status': {},
+            'misquote_count': 0
+        }
+        for c in citations:
+            status_key = c.status.value
+            type_key = c.citation_type.value
+            stats['by_status'][status_key] = stats['by_status'].get(status_key, 0) + 1
+            stats['by_type'][type_key] = stats['by_type'].get(type_key, 0) + 1
+            if c.status == CitationStatus.PENDING:
+                stats['pending'] += 1
+            elif c.status == CitationStatus.CONFIRMED:
+                stats['confirmed'] += 1
+            elif c.status == CitationStatus.REJECTED:
+                stats['rejected'] += 1
+            elif c.status == CitationStatus.INVALIDATED:
+                stats['invalidated'] += 1
+            if c.citation_type == CitationType.MISQUOTE:
+                stats['misquote_count'] += 1
+        return stats

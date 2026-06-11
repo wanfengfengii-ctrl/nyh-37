@@ -9,6 +9,7 @@ import pandas as pd
 
 from collation_project import CollationProject
 from collation_analyzer import CollationAnalyzer
+from citation_analyzer import CitationType
 from workflow_engine import DoubtStatus, DoubtRecord
 from audit_trail import AuditRecord, OperationType
 from collation_rules import CollationType
@@ -269,6 +270,168 @@ class CollationExporter:
             description=f'复核日志已导出: {len(records)}条操作记录'
         )
 
+    def export_citation_table(self,
+                              output_dir: str,
+                              volume: Optional[int] = None,
+                              operator: str = 'system') -> ExportResult:
+        self.project.workflow_engine.permission_manager.check_permission(operator, 'export_citations')
+
+        self._ensure_dir(output_dir)
+
+        book_name = self._safe_filename(self.project.book_name)
+        vol_suffix = f'_第{volume}卷' if volume else '_全卷'
+        filename = f'{book_name}{vol_suffix}_引文溯源表_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+        file_path = os.path.join(output_dir, filename)
+
+        records = []
+        citations = self.project.get_all_citations()
+        if volume:
+            citations = [c for c in citations if c.volume == volume]
+
+        for cit in citations:
+            source_info = []
+            for match in cit.matches:
+                for src in match.sources:
+                    loc_parts = []
+                    if src.source_book:
+                        loc_parts.append(f"书名:{src.source_book}")
+                    if src.source_volume:
+                        loc_parts.append(f"卷次:{src.source_volume}")
+                    if src.source_paragraph:
+                        loc_parts.append(f"段落:{src.source_paragraph}")
+                    if src.source_copy_batch:
+                        loc_parts.append(f"抄本:{src.source_copy_batch}")
+                    if src.source_chapter:
+                        loc_parts.append(f"章:{src.source_chapter}")
+                    if src.source_page:
+                        loc_parts.append(f"页:{src.source_page}")
+                    loc = '; '.join(loc_parts) if loc_parts else '未标注'
+                    src_txt = src.source_text or ''
+                    if len(src_txt) > 50:
+                        src_txt = src_txt[:47] + '...'
+                    source_info.append(
+                        f"[{match.match_basis}] {loc} | "
+                        f"相似度:{match.match_similarity:.2f} | "
+                        f"原文:{src_txt}"
+                    )
+
+            sources_str = ' | '.join(source_info) if source_info else '未匹配出处'
+
+            review_comments = '; '.join([
+                f'{h.get("timestamp", "")} [{h.get("operator", "")}] '
+                f'{h.get("action", "")}: {h.get("content", "")}'
+                for h in cit.processing_history
+            ]) if cit.processing_history else ''
+
+            extra_notes = ''
+            if cit.extra:
+                extra_notes = str(cit.extra)
+
+            records.append({
+                '引文编号': cit.citation_id,
+                '引文类型': cit.citation_type.value,
+                '书名': self.project.book_name,
+                '卷次': cit.volume,
+                '段落编号': cit.paragraph,
+                '抄本批次': cit.copy_batch,
+                '引文原文': cit.quoted_text,
+                '上下文': cit.original_text,
+                '置信度': f'{cit.confidence:.2f}',
+                '匹配依据': sources_str,
+                '状态': cit.status.value,
+                '确认人': cit.confirmed_by or '',
+                '确认时间': cit.confirmed_at.strftime('%Y-%m-%d %H:%M:%S') if cit.confirmed_at else '',
+                '创建人': cit.created_by,
+                '创建时间': cit.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                '更新时间': cit.updated_at.strftime('%Y-%m-%d %H:%M:%S'),
+                '失效原因': cit.invalidated_reason or '',
+                '备注': extra_notes,
+                '处理历史': review_comments
+            })
+
+        df = pd.DataFrame(records)
+        df.to_csv(file_path, index=False, encoding=self._encoding)
+
+        self.project.audit_trail.log(
+            operation_type=OperationType.EXPORT,
+            operator=operator,
+            operator_role=self.project.get_user_role(operator).value,
+            project_id=self.project.project_id,
+            description=f"导出引文溯源表: {filename} ({len(records)}条)",
+            extra={'file': filename, 'volume': volume, 'count': len(records)}
+        )
+
+        return ExportResult(
+            file_path=file_path,
+            file_type='引文溯源表',
+            record_count=len(records),
+            description=f'引文溯源表已导出: {len(records)}条引文记录'
+        )
+
+    def export_misquote_list(self,
+                             output_dir: str,
+                             volume: Optional[int] = None,
+                             operator: str = 'system') -> ExportResult:
+        self.project.workflow_engine.permission_manager.check_permission(operator, 'export_citations')
+
+        self._ensure_dir(output_dir)
+
+        book_name = self._safe_filename(self.project.book_name)
+        vol_suffix = f'_第{volume}卷' if volume else '_全卷'
+        filename = f'{book_name}{vol_suffix}_疑似误引清单_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
+        file_path = os.path.join(output_dir, filename)
+
+        records = []
+        citations = self.project.get_all_citations()
+        misquotes = [c for c in citations if c.citation_type == CitationType.MISQUOTE]
+        if volume:
+            misquotes = [c for c in misquotes if c.volume == volume]
+
+        for cit in misquotes:
+            for match in cit.matches:
+                if not match.is_suspected_misquote:
+                    continue
+                for src in match.sources:
+                    diff_str = match.match_basis or '未检测到具体差异'
+
+                    records.append({
+                        '引文编号': cit.citation_id,
+                        '书名': self.project.book_name,
+                        '卷次': cit.volume,
+                        '段落编号': cit.paragraph,
+                        '抄本批次': cit.copy_batch,
+                        '抄本文本': cit.quoted_text,
+                        '出处来源': '内部匹配' if match.is_internal else '外部匹配',
+                        '出处书名': src.source_book or '',
+                        '出处卷次': src.source_volume or '',
+                        '出处段落': src.source_paragraph or '',
+                        '出处抄本': src.source_copy_batch or '',
+                        '出处原文': src.source_text or '',
+                        '相似度': f'{match.match_similarity:.2f}',
+                        '差异详情': diff_str,
+                        '状态': cit.status.value,
+                        '创建时间': cit.created_at.strftime('%Y-%m-%d %H:%M:%S')
+                    })
+
+        df = pd.DataFrame(records)
+        df.to_csv(file_path, index=False, encoding=self._encoding)
+
+        self.project.audit_trail.log(
+            operation_type=OperationType.EXPORT,
+            operator=operator,
+            operator_role=self.project.get_user_role(operator).value,
+            project_id=self.project.project_id,
+            description=f"导出疑似误引清单: {filename} ({len(records)}条)",
+            extra={'file': filename, 'volume': volume, 'count': len(records)}
+        )
+
+        return ExportResult(
+            file_path=file_path,
+            file_type='疑似误引清单',
+            record_count=len(records),
+            description=f'疑似误引清单已导出: {len(records)}条疑似误引记录'
+        )
+
     def export_audit_trail(self,
                            output_dir: str,
                            operator: str = 'system') -> ExportResult:
@@ -322,6 +485,16 @@ class CollationExporter:
             results.append(self.export_review_log(output_dir, volume, operator))
         except Exception as e:
             results.append(ExportResult('', '复核日志', 0, f'导出失败: {str(e)}'))
+
+        try:
+            results.append(self.export_citation_table(output_dir, volume, operator))
+        except Exception as e:
+            results.append(ExportResult('', '引文溯源表', 0, f'导出失败: {str(e)}'))
+
+        try:
+            results.append(self.export_misquote_list(output_dir, volume, operator))
+        except Exception as e:
+            results.append(ExportResult('', '疑似误引清单', 0, f'导出失败: {str(e)}'))
 
         try:
             results.append(self.export_audit_trail(output_dir, operator))

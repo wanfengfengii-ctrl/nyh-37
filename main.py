@@ -21,6 +21,12 @@ from workflow_engine import Role, DoubtStatus, ReviewAction
 from collation_rules import CollationType
 from doubt_detector import DoubtDetector
 from collation_exporter import CollationExporter
+from citation_analyzer import (
+    CitationType as CitationTypeEnum,
+    CitationStatus as CitationStatusEnum,
+    CitationSource,
+    CitationAnalyzer
+)
 
 
 class AncientTextCollationApp:
@@ -112,6 +118,7 @@ class AncientTextCollationApp:
         self._build_comparison_tab()
         self._build_doubt_detection_tab()
         self._build_review_tab()
+        self._build_citation_tab()
         self._build_export_tab()
         self._build_audit_tab()
         self._build_stats_tab()
@@ -356,6 +363,592 @@ class AncientTextCollationApp:
         self.txt_review_history.pack(fill=tk.BOTH, expand=True)
         self.txt_review_history.config(state=tk.DISABLED)
 
+    def _build_citation_tab(self):
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="📚 引文溯源与互证分析")
+
+        top_frame = ttk.Frame(frame, padding=8)
+        top_frame.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(top_frame, text="检测类型:").pack(side=tk.LEFT, padx=2)
+        self.chk_cite_quotation = ttk.Checkbutton(top_frame, text="引文")
+        self.chk_cite_quotation.state(['selected'])
+        self.chk_cite_quotation.pack(side=tk.LEFT, padx=5)
+        self.chk_cite_allusion = ttk.Checkbutton(top_frame, text="典故")
+        self.chk_cite_allusion.pack(side=tk.LEFT, padx=5)
+        self.chk_cite_repetition = ttk.Checkbutton(top_frame, text="重复语段")
+        self.chk_cite_repetition.state(['selected'])
+        self.chk_cite_repetition.pack(side=tk.LEFT, padx=5)
+        self.chk_cite_misquote = ttk.Checkbutton(top_frame, text="疑似误引")
+        self.chk_cite_misquote.state(['selected'])
+        self.chk_cite_misquote.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(top_frame, text="▶️ 全量检测", command=self._on_citation_detect_all, style='Action.TButton').pack(side=tk.LEFT, padx=15)
+        ttk.Button(top_frame, text="📖 按卷检测", command=self._on_citation_detect_volume).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="📊 检测统计", command=self._on_citation_stats).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="🕸️ 互证图谱", command=self._on_show_citation_graph).pack(side=tk.LEFT, padx=5)
+
+        filter_frame = ttk.Frame(frame, padding=8)
+        filter_frame.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(filter_frame, text="状态筛选:").pack(side=tk.LEFT, padx=2)
+        self.cmb_citation_status = ttk.Combobox(filter_frame,
+            values=['全部'] + [s.value for s in CitationStatusEnum],
+            width=10, state='readonly')
+        self.cmb_citation_status.current(0)
+        self.cmb_citation_status.pack(side=tk.LEFT, padx=5)
+        self.cmb_citation_status.bind('<<ComboboxSelected>>', lambda e: self._load_citations_tree())
+
+        ttk.Label(filter_frame, text="类型筛选:").pack(side=tk.LEFT, padx=10)
+        self.cmb_citation_type = ttk.Combobox(filter_frame,
+            values=['全部'] + [t.value for t in CitationTypeEnum],
+            width=10, state='readonly')
+        self.cmb_citation_type.current(0)
+        self.cmb_citation_type.pack(side=tk.LEFT, padx=5)
+        self.cmb_citation_type.bind('<<ComboboxSelected>>', lambda e: self._load_citations_tree())
+
+        ttk.Label(filter_frame, text="书名:").pack(side=tk.LEFT, padx=10)
+        self.cmb_citation_book = ttk.Combobox(filter_frame, width=12, state='readonly')
+        self.cmb_citation_book.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(filter_frame, text="卷次:").pack(side=tk.LEFT, padx=10)
+        self.cmb_citation_volume = ttk.Combobox(filter_frame, width=10, state='readonly')
+        self.cmb_citation_volume.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(filter_frame, text="抄本:").pack(side=tk.LEFT, padx=10)
+        self.cmb_citation_copy = ttk.Combobox(filter_frame, width=10, state='readonly')
+        self.cmb_citation_copy.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(filter_frame, text="筛选", command=self._load_citations_tree).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_frame, text="重置", command=self._reset_citation_filter).pack(side=tk.LEFT, padx=2)
+
+        content_pane = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
+        content_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=5)
+
+        left_frame = ttk.Frame(content_pane)
+        content_pane.add(left_frame, weight=3)
+
+        tree_frame = ttk.Frame(left_frame)
+        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        yscroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        xscroll = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
+        self.tree_citations = ttk.Treeview(tree_frame, yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        yscroll.config(command=self.tree_citations.yview)
+        xscroll.config(command=self.tree_citations.xview)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        xscroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.tree_citations.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.tree_citations.bind('<<TreeviewSelect>>', self._on_citation_select)
+
+        cols = ('citation_id', 'citation_type', 'volume', 'paragraph', 'copy_batch',
+                'quoted_text', 'confidence', 'match_basis', 'status', 'created_at', 'confirmed_by')
+        self.tree_citations['columns'] = cols
+        for col in cols:
+            width_map = {'citation_id': 180, 'citation_type': 90, 'volume': 60, 'paragraph': 80,
+                        'copy_batch': 100, 'quoted_text': 250, 'confidence': 80,
+                        'match_basis': 200, 'status': 80, 'created_at': 150, 'confirmed_by': 100}
+            anchor = tk.CENTER if col in ('volume', 'paragraph', 'confidence', 'status', 'created_at') else tk.W
+            self.tree_citations.heading(col, text={
+                'citation_id': '引文ID', 'citation_type': '类型', 'volume': '卷次',
+                'paragraph': '段落', 'copy_batch': '抄本', 'quoted_text': '引文字段',
+                'confidence': '置信度', 'match_basis': '匹配依据', 'status': '状态',
+                'created_at': '创建时间', 'confirmed_by': '确认人'
+            }[col])
+            self.tree_citations.column(col, width=width_map.get(col, 150), anchor=anchor, stretch=True)
+        self.tree_citations['show'] = 'headings'
+
+        right_frame = ttk.Frame(content_pane)
+        content_pane.add(right_frame, weight=2)
+
+        detail_frame = ttk.LabelFrame(right_frame, text="引文详情", padding=8)
+        detail_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=2)
+
+        self.txt_citation_detail = scrolledtext.ScrolledText(detail_frame, height=10, font=('SimHei', 10), wrap=tk.WORD)
+        self.txt_citation_detail.pack(fill=tk.BOTH, expand=True)
+        self.txt_citation_detail.config(state=tk.DISABLED)
+
+        match_frame = ttk.LabelFrame(right_frame, text="匹配出处", padding=8)
+        match_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=2)
+
+        self.tree_citation_matches = ttk.Treeview(match_frame, height=8)
+        cols_match = ('book', 'volume', 'paragraph', 'copy', 'similarity', 'basis', 'is_misquote')
+        self.tree_citation_matches['columns'] = cols_match
+        for col in cols_match:
+            width_map2 = {'book': 150, 'volume': 60, 'paragraph': 70, 'copy': 100,
+                         'similarity': 80, 'basis': 200, 'is_misquote': 80}
+            anchor2 = tk.CENTER if col in ('volume', 'paragraph', 'similarity', 'is_misquote') else tk.W
+            self.tree_citation_matches.heading(col, text={
+                'book': '书名', 'volume': '卷', 'paragraph': '段',
+                'copy': '抄本', 'similarity': '相似度', 'basis': '匹配依据', 'is_misquote': '疑似误引'
+            }[col])
+            self.tree_citation_matches.column(col, width=width_map2.get(col, 120), anchor=anchor2, stretch=True)
+        self.tree_citation_matches['show'] = 'headings'
+        self.tree_citation_matches.pack(fill=tk.BOTH, expand=True)
+
+        action_frame = ttk.LabelFrame(right_frame, text="复核操作", padding=8)
+        action_frame.pack(side=tk.TOP, fill=tk.X, pady=2)
+
+        ttk.Label(action_frame, text="操作:").grid(row=0, column=0, sticky=tk.W, padx=2, pady=5)
+        self.cmb_citation_action = ttk.Combobox(action_frame,
+            values=['确认', '驳回', '补充出处'], width=10, state='readonly')
+        self.cmb_citation_action.current(0)
+        self.cmb_citation_action.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(action_frame, text="意见/说明:").grid(row=0, column=2, sticky=tk.W, padx=2, pady=5)
+        self.txt_citation_comment = scrolledtext.ScrolledText(action_frame, height=3, width=40, font=('SimHei', 10))
+        self.txt_citation_comment.grid(row=0, column=3, padx=5, pady=5, sticky=tk.EW)
+
+        btn_row = ttk.Frame(action_frame)
+        btn_row.grid(row=1, column=0, columnspan=4, pady=5)
+        ttk.Button(btn_row, text="📝 提交复核", command=self._on_submit_citation_review, style='Action.TButton').pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_row, text="🔄 重新激活", command=self._on_reactivate_citation).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_row, text="➕ 补充出处", command=self._on_supplement_source).pack(side=tk.LEFT, padx=10)
+
+        history_frame = ttk.LabelFrame(right_frame, text="处理历史", padding=8)
+        history_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=2)
+
+        self.txt_citation_history = scrolledtext.ScrolledText(history_frame, height=6, font=('SimHei', 10), wrap=tk.WORD)
+        self.txt_citation_history.pack(fill=tk.BOTH, expand=True)
+        self.txt_citation_history.config(state=tk.DISABLED)
+
+    def _on_citation_detect_all(self):
+        if not self.current_project or not self.current_project.analyzer:
+            messagebox.showinfo("提示", "请先选择项目并导入数据")
+            return
+        try:
+            detect_types = []
+            if 'selected' in self.chk_cite_quotation.state():
+                detect_types.append(CitationTypeEnum.QUOTATION)
+            if 'selected' in self.chk_cite_allusion.state():
+                detect_types.append(CitationTypeEnum.ALLUSION)
+            if 'selected' in self.chk_cite_repetition.state():
+                detect_types.append(CitationTypeEnum.REPETITION)
+            if 'selected' in self.chk_cite_misquote.state():
+                detect_types.append(CitationTypeEnum.MISQUOTE)
+
+            if not detect_types:
+                messagebox.showinfo("提示", "请至少选择一种检测类型")
+                return
+
+            summary = self.current_project.run_citation_detection(
+                operator=self.current_user,
+                detect_types=detect_types
+            )
+            msg = f"引文溯源检测完成！\n\n"
+            msg += f"检测到: {summary.total_detected} 条\n"
+            msg += f"新增: {summary.new_created} 条\n"
+            msg += f"跳过重复: {summary.duplicates_skipped} 条\n"
+            msg += f"疑似误引: {summary.misquote_count} 条\n\n"
+            msg += "按类型统计:\n"
+            for type_name, count in summary.by_type.items():
+                msg += f"  {type_name}: {count}条\n"
+            self.lbl_status.config(text=f"引文检测完成: 新增{summary.new_created}条")
+            messagebox.showinfo("检测完成", msg)
+            self._load_citations_tree()
+            self._load_projects_tree()
+        except Exception as e:
+            messagebox.showerror("检测失败", str(e))
+
+    def _on_citation_detect_volume(self):
+        if not self.current_project or not self.current_project.analyzer:
+            messagebox.showinfo("提示", "请先选择项目并导入数据")
+            return
+        vols = self.current_project.analyzer.volumes
+        if not vols:
+            messagebox.showinfo("提示", "无可检测的卷次")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("按卷检测引文")
+        win.geometry("300x150")
+        win.transient(self.root)
+        win.grab_set()
+
+        ttk.Label(win, text="选择卷次:").pack(pady=15)
+        cmb = ttk.Combobox(win, values=[f'第{v}卷' for v in vols], state='readonly', width=15)
+        cmb.current(0)
+        cmb.pack(pady=5)
+
+        def do_detect():
+            v = int(cmb.get().replace('第', '').replace('卷', ''))
+            try:
+                summary = self.current_project.run_citation_detection(
+                    operator=self.current_user,
+                    volume=v
+                )
+                self.lbl_status.config(text=f"第{v}卷引文检测完成: 新增{summary.new_created}条")
+                messagebox.showinfo("完成", f"第{v}卷检测完成\n新增: {summary.new_created}条")
+                win.destroy()
+                self._load_citations_tree()
+                self._load_projects_tree()
+            except Exception as e:
+                messagebox.showerror("检测失败", str(e))
+
+        ttk.Button(win, text="检测", command=do_detect, style='Action.TButton').pack(pady=10)
+
+    def _on_citation_stats(self):
+        if not self.current_project:
+            messagebox.showinfo("提示", "请先选择项目")
+            return
+        stats = self.current_project.get_citation_statistics()
+        msg = "引文溯源统计\n\n"
+        msg += f"总数: {stats.get('total', 0)}\n"
+        msg += f"待确认: {stats.get('pending', 0)}\n"
+        msg += f"已确认: {stats.get('confirmed', 0)}\n"
+        msg += f"已驳回: {stats.get('rejected', 0)}\n"
+        msg += f"已失效: {stats.get('invalidated', 0)}\n"
+        msg += f"疑似误引: {stats.get('misquote_count', 0)}\n\n"
+        msg += "按类型统计:\n"
+        for k, v in stats.get('by_type', {}).items():
+            msg += f"  {k}: {v}\n"
+        messagebox.showinfo("引文统计", msg)
+
+    def _on_show_citation_graph(self):
+        if not self.current_project:
+            messagebox.showinfo("提示", "请先选择项目")
+            return
+        try:
+            citations = self.current_project.get_all_citations()
+            if not citations:
+                messagebox.showinfo("提示", "暂无引文数据，请先运行检测")
+                return
+            graph = self.current_project.citation_analyzer.build_citation_graph(citations)
+            self._show_citation_graph_window(graph)
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
+
+    def _show_citation_graph_window(self, graph):
+        win = tk.Toplevel(self.root)
+        win.title("互证关系图谱")
+        win.geometry("900x700")
+        win.transient(self.root)
+
+        info_frame = ttk.LabelFrame(win, text="图谱信息", padding=8)
+        info_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=5)
+        ttk.Label(info_frame, text=f"节点数: {len(graph.nodes)}    关系数: {len(graph.edges)}").pack(side=tk.LEFT)
+
+        text_frame = ttk.LabelFrame(win, text="图谱数据（节点与关系列表）", padding=8)
+        text_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=5)
+
+        notebook = ttk.Notebook(text_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        nodes_frame = ttk.Frame(notebook)
+        notebook.add(nodes_frame, text="节点列表")
+        tree_nodes = ttk.Treeview(nodes_frame)
+        tree_nodes['columns'] = ('node_id', 'label', 'node_type', 'book', 'volume', 'paragraph')
+        for col in tree_nodes['columns']:
+            tree_nodes.heading(col, text={
+                'node_id': '节点ID', 'label': '标签', 'node_type': '类型',
+                'book': '书名', 'volume': '卷', 'paragraph': '段'
+            }[col])
+            tree_nodes.column(col, width=140 if col in ('node_id', 'label') else 90, anchor=tk.W)
+        tree_nodes['show'] = 'headings'
+        tree_nodes.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        for n in graph.nodes:
+            tree_nodes.insert('', tk.END, values=(
+                n.node_id, n.label, n.node_type, n.book,
+                n.volume or '', n.paragraph or ''
+            ))
+
+        edges_frame = ttk.Frame(notebook)
+        notebook.add(edges_frame, text="关系列表")
+        tree_edges = ttk.Treeview(edges_frame)
+        tree_edges['columns'] = ('source', 'target', 'relation', 'similarity')
+        for col in tree_edges['columns']:
+            tree_edges.heading(col, text={
+                'source': '源节点', 'target': '目标节点',
+                'relation': '关系', 'similarity': '相似度'
+            }[col])
+            tree_edges.column(col, width=220 if col in ('source', 'target') else 120, anchor=tk.W)
+        tree_edges['show'] = 'headings'
+        tree_edges.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        for e in graph.edges:
+            tree_edges.insert('', tk.END, values=(
+                e.source_id, e.target_id, e.relation,
+                f"{e.similarity:.2%}" if e.similarity > 0 else ''
+            ))
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=8)
+        ttk.Button(btn_frame, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
+
+    def _on_citation_select(self, event=None):
+        selection = self.tree_citations.selection()
+        if not selection:
+            return
+        citation_id = self.tree_citations.item(selection[0], 'values')[0]
+        if not self.current_project:
+            return
+        citation = self.current_project.workflow_engine.get_citation(citation_id)
+        if not citation:
+            return
+
+        self.txt_citation_detail.config(state=tk.NORMAL)
+        self.txt_citation_detail.delete('1.0', tk.END)
+        content = (f"引文ID: {citation.citation_id}\n"
+                   f"类型: {citation.citation_type.value}\n"
+                   f"位置: 第{citation.volume}卷 第{citation.paragraph}段 ({citation.copy_batch})\n"
+                   f"原文段落: {citation.original_text}\n"
+                   f"疑似引文字段: {citation.quoted_text}\n"
+                   f"位置范围: [{citation.start_pos}, {citation.end_pos}]\n"
+                   f"置信度: {citation.confidence:.2%}\n"
+                   f"匹配依据: {citation.match_basis}\n"
+                   f"状态: {citation.status.value}\n"
+                   f"创建人: {citation.created_by}  {citation.created_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                   f"确认人: {citation.confirmed_by or '未确认'}  "
+                   f"{citation.confirmed_at.strftime('%Y-%m-%d %H:%M:%S') if citation.confirmed_at else ''}\n"
+                   f"失效原因: {citation.invalidated_reason or '无'}\n"
+                   f"数据指纹: {citation.data_hash}")
+        if citation.confirmed_source:
+            src = citation.confirmed_source
+            content += f"\n\n已确认出处:\n  书名: {src.source_book}"
+            if src.source_volume:
+                content += f"\n  卷次: 第{src.source_volume}卷"
+            if src.source_paragraph:
+                content += f"\n  段落: 第{src.source_paragraph}段"
+            if src.source_chapter:
+                content += f"\n  章节: {src.source_chapter}"
+            if src.source_page:
+                content += f"\n  页码: {src.source_page}"
+            if src.source_text:
+                content += f"\n  原文: {src.source_text}"
+            if src.note:
+                content += f"\n  备注: {src.note}"
+        self.txt_citation_detail.insert('1.0', content)
+        self.txt_citation_detail.config(state=tk.DISABLED)
+
+        self.tree_citation_matches.delete(*self.tree_citation_matches.get_children())
+        for m in citation.matches:
+            self.tree_citation_matches.insert('', tk.END, values=(
+                m.match_book,
+                m.match_volume or '',
+                m.match_paragraph or '',
+                m.match_copy_batch or '',
+                f"{m.match_similarity:.2%}",
+                m.match_basis,
+                '是' if m.is_suspected_misquote else '否'
+            ))
+
+        self.txt_citation_history.config(state=tk.NORMAL)
+        self.txt_citation_history.delete('1.0', tk.END)
+        for h in citation.processing_history:
+            time_str = h['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            self.txt_citation_history.insert(tk.END,
+                f"{time_str} {h['operator']}[{h.get('operator_role', '')}] {h['action']}: {h['content']}\n")
+        self.txt_citation_history.config(state=tk.DISABLED)
+
+    def _on_submit_citation_review(self):
+        selection = self.tree_citations.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请选择要复核的引文")
+            return
+        citation_id = self.tree_citations.item(selection[0], 'values')[0]
+        action_str = self.cmb_citation_action.get()
+        content = self.txt_citation_comment.get('1.0', tk.END).strip()
+
+        if not content:
+            messagebox.showinfo("提示", "请填写复核意见")
+            return
+
+        try:
+            if action_str == '确认':
+                citation = self.current_project.confirm_citation(self.current_user, citation_id, note=content)
+            elif action_str == '驳回':
+                citation = self.current_project.reject_citation(self.current_user, citation_id, reason=content)
+            else:
+                messagebox.showinfo("提示", "请使用【补充出处】按钮添加出处信息")
+                return
+            self.lbl_status.config(text=f"引文复核成功: {citation_id} -> {citation.status.value}")
+            self.txt_citation_comment.delete('1.0', tk.END)
+            self._load_citations_tree()
+            self._load_projects_tree()
+            self._on_citation_select()
+        except Exception as e:
+            messagebox.showerror("复核失败", str(e))
+
+    def _on_reactivate_citation(self):
+        selection = self.tree_citations.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请选择要重新激活的引文")
+            return
+        citation_id = self.tree_citations.item(selection[0], 'values')[0]
+        try:
+            citation = self.current_project.reactivate_citation(self.current_user, citation_id)
+            self.lbl_status.config(text=f"已重新激活引文: {citation_id}")
+            self._load_citations_tree()
+            self._load_projects_tree()
+            self._on_citation_select()
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_supplement_source(self):
+        selection = self.tree_citations.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先选择一条引文")
+            return
+        citation_id = self.tree_citations.item(selection[0], 'values')[0]
+
+        win = tk.Toplevel(self.root)
+        win.title("补充引文出处")
+        win.geometry("500x420")
+        win.transient(self.root)
+        win.grab_set()
+
+        ttk.Label(win, text="书名*:", style='Subtitle.TLabel').grid(row=0, column=0, sticky=tk.W, padx=10, pady=8)
+        entry_book = ttk.Entry(win, width=40)
+        entry_book.grid(row=0, column=1, padx=10, pady=8)
+        entry_book.insert(0, self.current_project.book_name if self.current_project else '')
+
+        ttk.Label(win, text="卷次:", style='Subtitle.TLabel').grid(row=1, column=0, sticky=tk.W, padx=10, pady=8)
+        entry_vol = ttk.Entry(win, width=40)
+        entry_vol.grid(row=1, column=1, padx=10, pady=8)
+
+        ttk.Label(win, text="段落:", style='Subtitle.TLabel').grid(row=2, column=0, sticky=tk.W, padx=10, pady=8)
+        entry_para = ttk.Entry(win, width=40)
+        entry_para.grid(row=2, column=1, padx=10, pady=8)
+
+        ttk.Label(win, text="抄本批次:", style='Subtitle.TLabel').grid(row=3, column=0, sticky=tk.W, padx=10, pady=8)
+        entry_copy = ttk.Entry(win, width=40)
+        entry_copy.grid(row=3, column=1, padx=10, pady=8)
+
+        ttk.Label(win, text="章节:", style='Subtitle.TLabel').grid(row=4, column=0, sticky=tk.W, padx=10, pady=8)
+        entry_chapter = ttk.Entry(win, width=40)
+        entry_chapter.grid(row=4, column=1, padx=10, pady=8)
+
+        ttk.Label(win, text="页码:", style='Subtitle.TLabel').grid(row=5, column=0, sticky=tk.W, padx=10, pady=8)
+        entry_page = ttk.Entry(win, width=40)
+        entry_page.grid(row=5, column=1, padx=10, pady=8)
+
+        ttk.Label(win, text="出处原文:", style='Subtitle.TLabel').grid(row=6, column=0, sticky=tk.NW, padx=10, pady=8)
+        txt_source = scrolledtext.ScrolledText(win, width=40, height=4)
+        txt_source.grid(row=6, column=1, padx=10, pady=8)
+
+        ttk.Label(win, text="备注说明:", style='Subtitle.TLabel').grid(row=7, column=0, sticky=tk.NW, padx=10, pady=8)
+        txt_note = scrolledtext.ScrolledText(win, width=40, height=3)
+        txt_note.grid(row=7, column=1, padx=10, pady=8)
+
+        def do_supplement():
+            book = entry_book.get().strip()
+            if not book:
+                messagebox.showerror("错误", "书名为必填项")
+                return
+            vol_str = entry_vol.get().strip()
+            vol = int(vol_str) if vol_str.isdigit() else None
+            para_str = entry_para.get().strip()
+            para = int(para_str) if para_str.isdigit() else None
+            source = CitationSource(
+                source_book=book,
+                source_volume=vol,
+                source_paragraph=para,
+                source_copy_batch=entry_copy.get().strip() or None,
+                source_chapter=entry_chapter.get().strip(),
+                source_page=entry_page.get().strip(),
+                source_text=txt_source.get('1.0', tk.END).strip(),
+                note=txt_note.get('1.0', tk.END).strip()
+            )
+            try:
+                self.current_project.supplement_citation_source(
+                    self.current_user, citation_id, source,
+                    note=txt_note.get('1.0', tk.END).strip()
+                )
+                messagebox.showinfo("成功", "出处补充成功")
+                win.destroy()
+                self._load_citations_tree()
+                self._on_citation_select()
+            except Exception as e:
+                messagebox.showerror("失败", str(e))
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.grid(row=8, column=0, columnspan=2, pady=15)
+        ttk.Button(btn_frame, text="确认补充", command=do_supplement, style='Action.TButton').pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=10)
+
+    def _reset_citation_filter(self):
+        self.cmb_citation_status.current(0)
+        self.cmb_citation_type.current(0)
+        if self.cmb_citation_book['values']:
+            self.cmb_citation_book.current(0)
+        if self.cmb_citation_volume['values']:
+            self.cmb_citation_volume.current(0)
+        if self.cmb_citation_copy['values']:
+            self.cmb_citation_copy.current(0)
+        self._load_citations_tree()
+
+    def _load_citations_tree(self):
+        self.tree_citations.delete(*self.tree_citations.get_children())
+        if not self.current_project:
+            return
+
+        try:
+            pm = self.current_project.workflow_engine.permission_manager
+            pm.set_user_role(self.current_user, self.current_role)
+            pm.check_permission(self.current_user, 'view_citations')
+        except Exception:
+            return
+
+        status_filter = self.cmb_citation_status.get() if hasattr(self, 'cmb_citation_status') else ''
+        type_filter = self.cmb_citation_type.get() if hasattr(self, 'cmb_citation_type') else ''
+        vol_filter = self.cmb_citation_volume.get() if hasattr(self, 'cmb_citation_volume') else ''
+
+        status_val = None
+        if status_filter and status_filter != '全部':
+            for s in CitationStatusEnum:
+                if s.value == status_filter:
+                    status_val = s
+                    break
+
+        type_val = None
+        if type_filter and type_filter != '全部':
+            for t in CitationTypeEnum:
+                if t.value == type_filter:
+                    type_val = t
+                    break
+
+        vol_val = None
+        if vol_filter and vol_filter != '全部':
+            try:
+                vol_val = int(vol_filter.replace('第', '').replace('卷', ''))
+            except Exception:
+                pass
+
+        citations = self.current_project.get_citations(status_val, type_val, vol_val)
+
+        for c in citations:
+            self.tree_citations.insert('', tk.END, values=(
+                c.citation_id,
+                c.citation_type.value,
+                c.volume,
+                c.paragraph,
+                c.copy_batch,
+                c.quoted_text,
+                f"{c.confidence:.1%}",
+                c.match_basis,
+                c.status.value,
+                c.created_at.strftime('%Y-%m-%d %H:%M'),
+                c.confirmed_by or '-'
+            ))
+
+    def _refresh_citation_filters(self):
+        if not hasattr(self, 'cmb_citation_volume'):
+            return
+        book_vals = ['全部']
+        if self.analyzer:
+            book_vals = ['全部', self.analyzer.book_name]
+        self.cmb_citation_book['values'] = book_vals
+        if book_vals:
+            self.cmb_citation_book.current(0)
+
+        vols = ['全部'] + [f'第{v}卷' for v in (self.analyzer.volumes if self.analyzer else [])]
+        self.cmb_citation_volume['values'] = vols
+        if vols:
+            self.cmb_citation_volume.current(0)
+
+        copies = ['全部'] + list(self.analyzer.copy_batches if self.analyzer else [])
+        self.cmb_citation_copy['values'] = copies
+        if copies:
+            self.cmb_citation_copy.current(0)
+
     def _build_export_tab(self):
         frame = ttk.Frame(self.notebook)
         self.notebook.add(frame, text="📤 校勘结果导出")
@@ -373,6 +966,12 @@ class AncientTextCollationApp:
         self.chk_export_review = ttk.Checkbutton(left_frame, text="复核日志 (CSV)")
         self.chk_export_review.state(['selected'])
         self.chk_export_review.pack(anchor=tk.W, pady=2)
+        self.chk_export_citation = ttk.Checkbutton(left_frame, text="引文溯源表 (CSV)")
+        self.chk_export_citation.state(['!selected'])
+        self.chk_export_citation.pack(anchor=tk.W, pady=2)
+        self.chk_export_misquote = ttk.Checkbutton(left_frame, text="疑似误引清单 (CSV)")
+        self.chk_export_misquote.state(['!selected'])
+        self.chk_export_misquote.pack(anchor=tk.W, pady=2)
         self.chk_export_audit = ttk.Checkbutton(left_frame, text="审计日志 (CSV)")
         self.chk_export_audit.state(['!selected'])
         self.chk_export_audit.pack(anchor=tk.W, pady=2)
@@ -796,6 +1395,8 @@ class AncientTextCollationApp:
         self._load_project_detail()
         self._load_doubts_tree()
         self._load_review_tree()
+        self._load_citations_tree()
+        self._refresh_citation_filters()
         self._refresh_volume_filter()
 
     def _on_detect_all(self):
@@ -1038,6 +1639,12 @@ class AncientTextCollationApp:
             if 'selected' in self.chk_export_review.state():
                 r = exporter.export_review_log(out_dir, volume, self.current_user)
                 results.append(r)
+            if 'selected' in self.chk_export_citation.state():
+                r = exporter.export_citation_table(out_dir, volume, self.current_user)
+                results.append(r)
+            if 'selected' in self.chk_export_misquote.state():
+                r = exporter.export_misquote_list(out_dir, volume, self.current_user)
+                results.append(r)
             if 'selected' in self.chk_export_audit.state():
                 r = exporter.export_audit_trail(out_dir, self.current_user)
                 results.append(r)
@@ -1269,6 +1876,7 @@ class AncientTextCollationApp:
                 self._load_raw_data_tree()
                 self._load_doubts_tree()
                 self._load_review_tree()
+                self._load_citations_tree()
                 self._update_counts_label()
             else:
                 entry.focus_set()
@@ -1318,6 +1926,8 @@ class AncientTextCollationApp:
         self._refresh_volume_filter()
         self._load_doubts_tree()
         self._load_review_tree()
+        self._load_citations_tree()
+        self._refresh_citation_filters()
         self._load_comparison_tree()
         self._load_missing_info()
         self._load_stats_charts()
