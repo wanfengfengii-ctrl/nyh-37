@@ -384,7 +384,7 @@ class AncientTextCollationApp:
         self.chk_cite_misquote.pack(side=tk.LEFT, padx=5)
 
         ttk.Button(top_frame, text="▶️ 全量检测", command=self._on_citation_detect_all, style='Action.TButton').pack(side=tk.LEFT, padx=15)
-        ttk.Button(top_frame, text="📖 按卷检测", command=self._on_citation_detect_volume).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="🎯 范围检测", command=self._on_citation_detect_volume).pack(side=tk.LEFT, padx=5)
         ttk.Button(top_frame, text="📊 检测统计", command=self._on_citation_stats).pack(side=tk.LEFT, padx=5)
         ttk.Button(top_frame, text="🕸️ 互证图谱", command=self._on_show_citation_graph).pack(side=tk.LEFT, padx=5)
 
@@ -555,36 +555,77 @@ class AncientTextCollationApp:
             messagebox.showinfo("提示", "请先选择项目并导入数据")
             return
         vols = self.current_project.analyzer.volumes
+        copies = self.current_project.analyzer.copy_batches
         if not vols:
             messagebox.showinfo("提示", "无可检测的卷次")
             return
         win = tk.Toplevel(self.root)
-        win.title("按卷检测引文")
-        win.geometry("300x150")
+        win.title("范围检测引文")
+        win.geometry("340x230")
         win.transient(self.root)
         win.grab_set()
 
-        ttk.Label(win, text="选择卷次:").pack(pady=15)
-        cmb = ttk.Combobox(win, values=[f'第{v}卷' for v in vols], state='readonly', width=15)
-        cmb.current(0)
-        cmb.pack(pady=5)
+        ttk.Label(win, text="选择卷次:").pack(pady=(15, 5), anchor=tk.W, padx=30)
+        cmb_vol = ttk.Combobox(win, values=['全部'] + [f'第{v}卷' for v in vols], state='readonly', width=20)
+        cmb_vol.current(0)
+        cmb_vol.pack(pady=2)
+
+        ttk.Label(win, text="选择抄本:").pack(pady=(10, 5), anchor=tk.W, padx=30)
+        cmb_copy = ttk.Combobox(win, values=['全部'] + list(copies), state='readonly', width=20)
+        cmb_copy.current(0)
+        cmb_copy.pack(pady=2)
 
         def do_detect():
-            v = int(cmb.get().replace('第', '').replace('卷', ''))
+            vol_str = cmb_vol.get()
+            copy_str = cmb_copy.get()
+            v = None
+            if vol_str and vol_str != '全部':
+                v = int(vol_str.replace('第', '').replace('卷', ''))
+            c = None
+            if copy_str and copy_str != '全部':
+                c = copy_str
+
+            detect_types = []
+            if 'selected' in self.chk_cite_quotation.state():
+                detect_types.append(CitationTypeEnum.QUOTATION)
+            if 'selected' in self.chk_cite_allusion.state():
+                detect_types.append(CitationTypeEnum.ALLUSION)
+            if 'selected' in self.chk_cite_repetition.state():
+                detect_types.append(CitationTypeEnum.REPETITION)
+            if 'selected' in self.chk_cite_misquote.state():
+                detect_types.append(CitationTypeEnum.MISQUOTE)
+
+            if not detect_types:
+                messagebox.showinfo("提示", "请至少选择一种检测类型")
+                return
+
+            scope_desc = []
+            if v:
+                scope_desc.append(f'第{v}卷')
+            else:
+                scope_desc.append('全卷')
+            if c:
+                scope_desc.append(c)
+            else:
+                scope_desc.append('全部抄本')
+            scope = ' '.join(scope_desc)
+
             try:
                 summary = self.current_project.run_citation_detection(
                     operator=self.current_user,
-                    volume=v
+                    volume=v,
+                    copy_batch=c,
+                    detect_types=detect_types
                 )
-                self.lbl_status.config(text=f"第{v}卷引文检测完成: 新增{summary.new_created}条")
-                messagebox.showinfo("完成", f"第{v}卷检测完成\n新增: {summary.new_created}条")
+                self.lbl_status.config(text=f"{scope}引文检测完成: 新增{summary.new_created}条")
+                messagebox.showinfo("完成", f"{scope}检测完成\n新增: {summary.new_created}条\n总检测: {summary.total_detected}条\n跳过重复: {summary.duplicates_skipped}条")
                 win.destroy()
                 self._load_citations_tree()
                 self._load_projects_tree()
             except Exception as e:
                 messagebox.showerror("检测失败", str(e))
 
-        ttk.Button(win, text="检测", command=do_detect, style='Action.TButton').pack(pady=10)
+        ttk.Button(win, text="开始检测", command=do_detect, style='Action.TButton').pack(pady=15)
 
     def _on_citation_stats(self):
         if not self.current_project:
@@ -889,7 +930,9 @@ class AncientTextCollationApp:
 
         status_filter = self.cmb_citation_status.get() if hasattr(self, 'cmb_citation_status') else ''
         type_filter = self.cmb_citation_type.get() if hasattr(self, 'cmb_citation_type') else ''
+        book_filter = self.cmb_citation_book.get() if hasattr(self, 'cmb_citation_book') else ''
         vol_filter = self.cmb_citation_volume.get() if hasattr(self, 'cmb_citation_volume') else ''
+        copy_filter = self.cmb_citation_copy.get() if hasattr(self, 'cmb_citation_copy') else ''
 
         status_val = None
         if status_filter and status_filter != '全部':
@@ -912,7 +955,14 @@ class AncientTextCollationApp:
             except Exception:
                 pass
 
-        citations = self.current_project.get_citations(status_val, type_val, vol_val)
+        copy_val = None
+        if copy_filter and copy_filter != '全部':
+            copy_val = copy_filter
+
+        citations = self.current_project.get_citations(status_val, type_val, vol_val, copy_val)
+
+        if book_filter and book_filter != '全部':
+            citations = [c for c in citations if self.current_project.book_name == book_filter]
 
         for c in citations:
             self.tree_citations.insert('', tk.END, values=(
@@ -1656,9 +1706,11 @@ class AncientTextCollationApp:
             self.txt_export_preview.delete('1.0', tk.END)
             self.txt_export_preview.insert(tk.END, "导出完成！\n\n")
             for r in results:
-                status = "✓" if r.success else "✗"
-                msg = r.error if r.error else f"{r.record_count}条记录" if r.record_count else ""
-                self.txt_export_preview.insert(tk.END, f"{status} {os.path.basename(r.file_path)}  {msg}\n")
+                is_success = r.record_count > 0 and '失败' not in r.description
+                status = "✓" if is_success else "✗"
+                msg = r.description
+                fname = os.path.basename(r.file_path) if r.file_path else r.file_type
+                self.txt_export_preview.insert(tk.END, f"{status} {fname}  {msg}\n")
             self.txt_export_preview.config(state=tk.DISABLED)
 
             self.lbl_status.config(text=f"导出完成: {len(results)}个文件")
