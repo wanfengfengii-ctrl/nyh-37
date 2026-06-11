@@ -162,11 +162,11 @@ class CollationProject:
             'by_type': {},
             'by_status': {}
         }
-        doubts = self.workflow_engine.list_doubts(self.project_id)
+        doubts = self.workflow_engine.get_all_doubts(self.project_id)
         for d in doubts:
             stats['total_doubts'] += 1
             status_key = d.status.value
-            type_key = d.collation_type.value
+            type_key = d.collation_type
             stats['by_status'][status_key] = stats['by_status'].get(status_key, 0) + 1
             stats['by_type'][type_key] = stats['by_type'].get(type_key, 0) + 1
             if d.status == DoubtStatus.PENDING:

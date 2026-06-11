@@ -91,6 +91,18 @@ class DoubtRecord:
     extra: Dict = field(default_factory=dict)
 
     @property
+    def created_by(self) -> str:
+        return self.extra.get('created_by', '')
+
+    @property
+    def invalid_reason(self) -> str:
+        return self.invalidated_reason
+
+    @property
+    def data_fingerprint(self) -> str:
+        return self.data_hash
+
+    @property
     def unique_key(self) -> str:
         return f'{self.project_id}|{self.volume}|{self.paragraph}|{self.copy_batch}|{self.collation_type}|{self.original_text}|{self.suggested_text}'
 
@@ -151,6 +163,11 @@ class PermissionManager:
 
     def _init_default_permissions(self):
         self.add_permission(Permission(
+            name='create_project',
+            description='创建项目',
+            roles={Role.ADMIN, Role.COLLATOR}
+        ))
+        self.add_permission(Permission(
             name='view_project',
             description='查看项目',
             roles={Role.ADMIN, Role.COLLATOR, Role.REVIEWER, Role.GUEST}
@@ -164,6 +181,11 @@ class PermissionManager:
             name='delete_project',
             description='删除项目',
             roles={Role.ADMIN}
+        ))
+        self.add_permission(Permission(
+            name='view_doubts',
+            description='查看疑点',
+            roles={Role.ADMIN, Role.COLLATOR, Role.REVIEWER, Role.GUEST}
         ))
         self.add_permission(Permission(
             name='import_data',
@@ -243,7 +265,9 @@ class PermissionManager:
     def check_permission(self, username: str, permission_name: str) -> None:
         if not self.has_permission(username, permission_name):
             role = self.get_user_role(username)
-            raise PermissionError(f"用户【{username}】(角色: {role.value}) 没有权限执行: {self._permissions.get(permission_name, permission_name).description}")
+            perm = self._permissions.get(permission_name)
+            perm_desc = perm.description if perm else permission_name
+            raise PermissionError(f"用户【{username}】(角色: {role.value}) 没有权限执行: {perm_desc}")
 
 
 class WorkflowEngine:
@@ -298,6 +322,8 @@ class WorkflowEngine:
             raise ValueError(f"同一疑点已存在，不允许重复创建: {temp_key}")
 
         doubt_id = self._generate_doubt_id(project_id)
+        extra_data = extra or {}
+        extra_data['created_by'] = creator
         doubt = DoubtRecord(
             doubt_id=doubt_id,
             project_id=project_id,
@@ -311,7 +337,7 @@ class WorkflowEngine:
             reason=reason,
             rule_id=rule_id,
             data_hash=data_hash,
-            extra=extra or {}
+            extra=extra_data
         )
 
         self._doubts[doubt_id] = doubt

@@ -825,12 +825,12 @@ class AncientTextCollationApp:
             )
             msg = f"疑点检测完成！\n\n"
             msg += f"检测到: {summary.total_detected} 个\n"
-            msg += f"新增: {summary.total_new} 个\n"
-            msg += f"跳过重复: {summary.total_skipped} 个\n\n"
+            msg += f"新增: {summary.new_created} 个\n"
+            msg += f"跳过重复: {summary.duplicates_skipped} 个\n\n"
             msg += "按类型统计:\n"
             for type_name, count in summary.by_type.items():
                 msg += f"  {type_name}: {count}个\n"
-            self.lbl_status.config(text=f"检测完成: 新增{summary.total_new}个疑点")
+            self.lbl_status.config(text=f"检测完成: 新增{summary.new_created}个疑点")
             messagebox.showinfo("检测完成", msg)
             self._load_doubts_tree()
             self._load_review_tree()
@@ -883,8 +883,8 @@ class AncientTextCollationApp:
                         )
                     except Exception:
                         pass
-                self.lbl_status.config(text=f"第{v}卷检测完成: 新增{summary.total_new}个疑点")
-                messagebox.showinfo("完成", f"第{v}卷检测完成\n新增: {summary.total_new}个")
+                self.lbl_status.config(text=f"第{v}卷检测完成: 新增{summary.new_created}个疑点")
+                messagebox.showinfo("完成", f"第{v}卷检测完成\n新增: {summary.new_created}个")
                 win.destroy()
                 self._load_doubts_tree()
                 self._load_review_tree()
@@ -914,7 +914,7 @@ class AncientTextCollationApp:
         self.txt_doubt_detail.config(state=tk.NORMAL)
         self.txt_doubt_detail.delete('1.0', tk.END)
         content = (f"疑点ID: {doubt.doubt_id}\n"
-                   f"类型: {doubt.collation_type.value}\n"
+                   f"类型: {doubt.collation_type}\n"
                    f"位置: 第{doubt.volume}卷 第{doubt.paragraph}段 ({doubt.copy_batch})\n"
                    f"原文: {doubt.original_text}\n"
                    f"建议: {doubt.suggested_text}\n"
@@ -939,7 +939,7 @@ class AncientTextCollationApp:
         self.lbl_review_detail.config(text=f"疑点: {doubt.doubt_id} [{doubt.status.value}]")
         self.txt_review_detail.config(state=tk.NORMAL)
         self.txt_review_detail.delete('1.0', tk.END)
-        content = (f"类型: {doubt.collation_type.value}    位置: 第{doubt.volume}卷 第{doubt.paragraph}段 ({doubt.copy_batch})\n"
+        content = (f"类型: {doubt.collation_type}    位置: 第{doubt.volume}卷 第{doubt.paragraph}段 ({doubt.copy_batch})\n"
                    f"原文: {doubt.original_text}\n"
                    f"建议: {doubt.suggested_text}\n"
                    f"置信度: {doubt.confidence}    原因: {doubt.reason}\n"
@@ -1050,7 +1050,7 @@ class AncientTextCollationApp:
             self.txt_export_preview.insert(tk.END, "导出完成！\n\n")
             for r in results:
                 status = "✓" if r.success else "✗"
-                msg = r.error if r.error else f"{r.row_count}条记录" if r.row_count else ""
+                msg = r.error if r.error else f"{r.record_count}条记录" if r.record_count else ""
                 self.txt_export_preview.insert(tk.END, f"{status} {os.path.basename(r.file_path)}  {msg}\n")
             self.txt_export_preview.config(state=tk.DISABLED)
 
@@ -1092,14 +1092,14 @@ class AncientTextCollationApp:
             return
 
         try:
-            records = self.current_project.audit_trail.query(
+            records = self.current_project.audit_trail.query_records(
                 project_id=self.current_project.project_id,
                 operator=user,
                 operation_type=op_type,
                 start_time=start_time,
-                end_time=end_time,
-                limit=500
+                end_time=end_time
             )
+            records = records[:500]
             self.txt_audit_timeline.config(state=tk.NORMAL)
             self.txt_audit_timeline.delete('1.0', tk.END)
             if not records:
@@ -1382,12 +1382,13 @@ class AncientTextCollationApp:
             return
 
         try:
-            self.current_project.workflow_engine.permission_manager.check_permission(
-                self.current_user, self.current_role, 'view_doubts')
+            pm = self.current_project.workflow_engine.permission_manager
+            pm.set_user_role(self.current_user, self.current_role)
+            pm.check_permission(self.current_user, 'view_doubts')
         except Exception:
             return
 
-        doubts = self.current_project.workflow_engine.list_doubts(self.current_project.project_id)
+        doubts = self.current_project.workflow_engine.get_all_doubts(self.current_project.project_id)
 
         status_filter = self.cmb_doubt_status.get()
         type_filter = self.cmb_doubt_type.get()
@@ -1396,14 +1397,14 @@ class AncientTextCollationApp:
         for d in doubts:
             if status_filter and status_filter != '全部' and d.status.value != status_filter:
                 continue
-            if type_filter and type_filter != '全部' and d.collation_type.value != type_filter:
+            if type_filter and type_filter != '全部' and d.collation_type != type_filter:
                 continue
             filtered.append(d)
 
         for d in filtered:
             self.tree_doubts.insert('', tk.END, values=(
                 d.doubt_id,
-                d.collation_type.value,
+                d.collation_type,
                 d.volume,
                 d.paragraph,
                 d.copy_batch,
@@ -1421,12 +1422,13 @@ class AncientTextCollationApp:
             return
 
         try:
-            self.current_project.workflow_engine.permission_manager.check_permission(
-                self.current_user, self.current_role, 'review_doubts')
+            pm = self.current_project.workflow_engine.permission_manager
+            pm.set_user_role(self.current_user, self.current_role)
+            pm.check_permission(self.current_user, 'review_doubt')
         except Exception:
             return
 
-        doubts = self.current_project.workflow_engine.list_doubts(self.current_project.project_id)
+        doubts = self.current_project.workflow_engine.get_all_doubts(self.current_project.project_id)
 
         status_filter = self.cmb_review_status.get()
         only_mine = 'selected' in self.chk_only_mine.state()
@@ -1442,7 +1444,7 @@ class AncientTextCollationApp:
         for d in filtered:
             self.tree_review.insert('', tk.END, values=(
                 d.doubt_id,
-                d.collation_type.value,
+                d.collation_type,
                 d.volume,
                 d.paragraph,
                 d.copy_batch,
