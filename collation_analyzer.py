@@ -3,7 +3,7 @@
 """
 import pandas as pd
 import difflib
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Dict, List, Tuple, Set, Optional, Callable
 from collections import Counter
 
 
@@ -27,6 +27,21 @@ class CollationAnalyzer:
         self._comparison_table: Optional[pd.DataFrame] = None
         self._diff_matrix: Optional[Dict[Tuple[str, str], int]] = None
         self._stats_dirty = True
+        self._on_data_change_callbacks: List[Callable[[int, str, any], None]] = []
+
+    def add_data_change_callback(self, callback: Callable[[int, str, any], None]):
+        self._on_data_change_callbacks.append(callback)
+
+    def remove_data_change_callback(self, callback: Callable[[int, str, any], None]):
+        if callback in self._on_data_change_callbacks:
+            self._on_data_change_callbacks.remove(callback)
+
+    def _notify_data_change(self, index: int, column: str, new_value: any):
+        for callback in self._on_data_change_callbacks:
+            try:
+                callback(index, column, new_value)
+            except Exception:
+                pass
 
     def invalidate_stats(self):
         self._stats_dirty = True
@@ -82,15 +97,18 @@ class CollationAnalyzer:
         self.copy_batches = sorted(self.df['抄本批次'].unique().tolist())
         self.volumes = sorted(self.df['卷次'].unique().tolist())
         self.invalidate_stats()
+        self._notify_data_change(index, column, new_val)
         return True, ""
 
     def delete_record(self, index: int) -> bool:
         if index < 0 or index >= len(self.df):
             return False
+        row = self.df.iloc[index].to_dict()
         self.df = self.df.drop(index).reset_index(drop=True)
         self.copy_batches = sorted(self.df['抄本批次'].unique().tolist())
         self.volumes = sorted(self.df['卷次'].unique().tolist())
         self.invalidate_stats()
+        self._notify_data_change(index, '__DELETE__', row)
         return True
 
     def get_missing_paragraphs(self) -> Dict[Tuple[str, int], List[Tuple[int, int]]]:
