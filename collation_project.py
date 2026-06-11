@@ -198,6 +198,17 @@ class CollationProject:
         stats['rejected_citations'] = cite_stats.get('rejected', 0)
         stats['invalid_citations'] = cite_stats.get('invalidated', 0)
         stats['misquote_citations'] = cite_stats.get('misquote_count', 0)
+        case_stats = self.workflow_engine.get_case_statistics(self.project_id)
+        stats['total_cases'] = case_stats.get('total_cases', 0)
+        stats['active_cases'] = case_stats.get('active_cases', 0)
+        stats['invalidated_cases'] = case_stats.get('invalidated_cases', 0)
+        stats['total_recommendations'] = case_stats.get('total_recommendations', 0)
+        stats['pending_recommendations'] = case_stats.get('pending_recommendations', 0)
+        stats['accepted_recommendations'] = case_stats.get('accepted_recommendations', 0)
+        stats['rejected_recommendations'] = case_stats.get('rejected_recommendations', 0)
+        stats['accept_rate'] = case_stats.get('accept_rate', 0.0)
+        stats['cases_by_source'] = case_stats.get('by_source_type', {})
+        stats['cases_by_category'] = case_stats.get('by_category', {})
         return stats
 
     def assign_user(self, admin_user: str, username: str, role: Role):
@@ -316,7 +327,20 @@ class CollationProject:
             reason=f"原始数据被修改: {changed_cols}"
         )
 
-        all_invalidated_ids = invalidated_doubt_ids + invalidated_citation_ids
+        invalidated_rec_ids = invalidated_doubt_ids + invalidated_citation_ids
+        invalidated_recommendation_ids = []
+        for rid in invalidated_doubt_ids:
+            invs = self.workflow_engine.case_library.invalidate_recommendations_for_target(
+                rid, '原始疑点数据被修改'
+            )
+            invalidated_recommendation_ids.extend(invs)
+        for rid in invalidated_citation_ids:
+            invs = self.workflow_engine.case_library.invalidate_recommendations_for_target(
+                rid, '原始引文数据被修改'
+            )
+            invalidated_recommendation_ids.extend(invs)
+
+        all_invalidated_ids = invalidated_rec_ids + invalidated_recommendation_ids
 
         self.audit_trail.log(
             operation_type=OperationType.DATA_UPDATE,
@@ -325,10 +349,14 @@ class CollationProject:
             project_id=self.project_id,
             target_id=f'record-{index}',
             target_type='DataRecord',
-            description=f"修改数据行{index + 2}的【{column}】，导致{len(invalidated_doubt_ids)}个疑点、{len(invalidated_citation_ids)}个引文溯源失效",
+            description=f"修改数据行{index + 2}的【{column}】，导致{len(invalidated_doubt_ids)}个疑点、{len(invalidated_citation_ids)}个引文溯源、{len(invalidated_recommendation_ids)}个推荐失效",
             old_value=old_row,
             new_value=new_row,
-            extra={'invalidated_doubts': invalidated_doubt_ids, 'invalidated_citations': invalidated_citation_ids}
+            extra={
+                'invalidated_doubts': invalidated_doubt_ids,
+                'invalidated_citations': invalidated_citation_ids,
+                'invalidated_recommendations': invalidated_recommendation_ids
+            }
         )
 
         return True, "", all_invalidated_ids
@@ -363,7 +391,20 @@ class CollationProject:
             reason=f"关联数据行被删除"
         )
 
-        all_invalidated_ids = invalidated_doubt_ids + invalidated_citation_ids
+        invalidated_rec_ids = invalidated_doubt_ids + invalidated_citation_ids
+        invalidated_recommendation_ids = []
+        for rid in invalidated_doubt_ids:
+            invs = self.workflow_engine.case_library.invalidate_recommendations_for_target(
+                rid, '关联疑点数据行被删除'
+            )
+            invalidated_recommendation_ids.extend(invs)
+        for rid in invalidated_citation_ids:
+            invs = self.workflow_engine.case_library.invalidate_recommendations_for_target(
+                rid, '关联引文数据行被删除'
+            )
+            invalidated_recommendation_ids.extend(invs)
+
+        all_invalidated_ids = invalidated_rec_ids + invalidated_recommendation_ids
 
         success = self.analyzer.delete_record(index)
         if success:
@@ -374,9 +415,13 @@ class CollationProject:
                 project_id=self.project_id,
                 target_id=f'record-{index}',
                 target_type='DataRecord',
-                description=f"删除数据行{index + 2}，导致{len(invalidated_doubt_ids)}个疑点、{len(invalidated_citation_ids)}个引文溯源失效",
+                description=f"删除数据行{index + 2}，导致{len(invalidated_doubt_ids)}个疑点、{len(invalidated_citation_ids)}个引文溯源、{len(invalidated_recommendation_ids)}个推荐失效",
                 old_value=old_row,
-                extra={'invalidated_doubts': invalidated_doubt_ids, 'invalidated_citations': invalidated_citation_ids}
+                extra={
+                    'invalidated_doubts': invalidated_doubt_ids,
+                    'invalidated_citations': invalidated_citation_ids,
+                    'invalidated_recommendations': invalidated_recommendation_ids
+                }
             )
 
         return success, all_invalidated_ids
@@ -404,7 +449,22 @@ class CollationProject:
         return self.workflow_engine.review_doubt(reviewer, doubt_id, action, content, new_assignee)
 
     def resolve_doubt(self, resolver: str, doubt_id: str, resolution: str) -> DoubtRecord:
-        return self.workflow_engine.resolve_doubt(resolver, doubt_id, resolution)
+        doubt = self.workflow_engine.resolve_doubt(resolver, doubt_id, resolution)
+        try:
+            if self.workflow_engine.permission_manager.has_permission(resolver, 'create_case'):
+                from case_library import CaseResolution
+                case_res = CaseResolution(
+                    conclusion='已解决',
+                    basis=resolution,
+                    final_text=doubt.suggested_text,
+                    notes=f'自动沉淀自疑点解决: {doubt_id}'
+                )
+                self.workflow_engine.create_case_from_doubt(
+                    resolver, doubt_id, self.book_name, case_res
+                )
+        except Exception:
+            pass
+        return doubt
 
     def reactivate_doubt(self, operator: str, doubt_id: str) -> DoubtRecord:
         return self.workflow_engine.reactivate_doubt(operator, doubt_id)
@@ -456,10 +516,39 @@ class CollationProject:
         return self.workflow_engine.get_all_citations(self.project_id)
 
     def confirm_citation(self, reviewer: str, citation_id: str, source=None, note: str = ''):
-        return self.workflow_engine.confirm_citation(reviewer, citation_id, source, note)
+        citation = self.workflow_engine.confirm_citation(reviewer, citation_id, source, note)
+        try:
+            if self.workflow_engine.permission_manager.has_permission(reviewer, 'create_case'):
+                from case_library import CaseResolution
+                case_res = CaseResolution(
+                    conclusion='已确认',
+                    basis=note or citation.match_basis,
+                    reference_sources=[source.to_dict()] if source else [],
+                    notes=f'自动沉淀自引文确认: {citation_id}'
+                )
+                self.workflow_engine.create_case_from_citation(
+                    reviewer, citation_id, self.book_name, case_res
+                )
+        except Exception:
+            pass
+        return citation
 
     def reject_citation(self, reviewer: str, citation_id: str, reason: str = ''):
-        return self.workflow_engine.reject_citation(reviewer, citation_id, reason)
+        citation = self.workflow_engine.reject_citation(reviewer, citation_id, reason)
+        try:
+            if self.workflow_engine.permission_manager.has_permission(reviewer, 'create_case'):
+                from case_library import CaseResolution
+                case_res = CaseResolution(
+                    conclusion='已驳回',
+                    basis=reason or citation.match_basis,
+                    notes=f'自动沉淀自引文驳回: {citation_id}'
+                )
+                self.workflow_engine.create_case_from_citation(
+                    reviewer, citation_id, self.book_name, case_res
+                )
+        except Exception:
+            pass
+        return citation
 
     def supplement_citation_source(self, operator: str, citation_id: str, source, note: str = ''):
         return self.workflow_engine.supplement_citation_source(operator, citation_id, source, note)
@@ -469,6 +558,67 @@ class CollationProject:
 
     def get_citation_statistics(self) -> Dict:
         return self.workflow_engine.get_citation_statistics(self.project_id)
+
+    def create_case_from_doubt(self, operator: str, doubt_id: str,
+                                resolution=None, extra_notes: str = ''):
+        return self.workflow_engine.create_case_from_doubt(
+            operator, doubt_id, self.book_name, resolution, extra_notes
+        )
+
+    def create_case_from_citation(self, operator: str, citation_id: str,
+                                   resolution=None, extra_notes: str = ''):
+        return self.workflow_engine.create_case_from_citation(
+            operator, citation_id, self.book_name, resolution, extra_notes
+        )
+
+    def get_case(self, case_id: str):
+        return self.workflow_engine.get_case(case_id)
+
+    def get_all_cases(self):
+        return self.workflow_engine.get_all_cases(self.project_id)
+
+    def filter_cases(self, case_filter):
+        return self.workflow_engine.filter_cases(case_filter)
+
+    def update_case(self, operator: str, case_id: str, **kwargs):
+        return self.workflow_engine.update_case(operator, case_id, **kwargs)
+
+    def invalidate_case(self, operator: str, case_id: str, reason: str = ''):
+        return self.workflow_engine.invalidate_case(operator, case_id, reason)
+
+    def reactivate_case(self, operator: str, case_id: str):
+        return self.workflow_engine.reactivate_case(operator, case_id)
+
+    def generate_recommendations_for_doubt(self, operator: str, doubt_id: str, top_k: int = 5):
+        return self.workflow_engine.generate_recommendations_for_doubt(
+            operator, doubt_id, self.book_name, top_k
+        )
+
+    def generate_recommendations_for_citation(self, operator: str, citation_id: str, top_k: int = 5):
+        return self.workflow_engine.generate_recommendations_for_citation(
+            operator, citation_id, self.book_name, top_k
+        )
+
+    def get_recommendations_for_target(self, target_record_id: str,
+                                        target_record_type=None, status=None):
+        return self.workflow_engine.get_recommendations_for_target(
+            target_record_id, target_record_type, status
+        )
+
+    def get_all_recommendations(self):
+        return self.workflow_engine.get_all_recommendations(self.project_id)
+
+    def accept_recommendation(self, operator: str, rec_id: str, note: str = ''):
+        return self.workflow_engine.accept_recommendation(operator, rec_id, note)
+
+    def reject_recommendation(self, operator: str, rec_id: str, reason: str = ''):
+        return self.workflow_engine.reject_recommendation(operator, rec_id, reason)
+
+    def modify_recommendation(self, operator: str, rec_id: str, modified: Dict, note: str = ''):
+        return self.workflow_engine.modify_recommendation(operator, rec_id, modified, note)
+
+    def get_case_statistics(self) -> Dict:
+        return self.workflow_engine.get_case_statistics(self.project_id)
 
     def get_statistics(self) -> Dict:
         doubt_stats = self.workflow_engine.get_statistics(self.project_id)

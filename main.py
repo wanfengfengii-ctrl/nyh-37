@@ -27,6 +27,15 @@ from citation_analyzer import (
     CitationSource,
     CitationAnalyzer
 )
+from case_library import (
+    CaseSourceType,
+    CaseStatus,
+    CaseCategory,
+    RecommendationStatus,
+    CaseFilter,
+    RecommendationFilter,
+    CaseResolution
+)
 
 
 class AncientTextCollationApp:
@@ -48,6 +57,8 @@ class AncientTextCollationApp:
         self.doubt_detector: DoubtDetector = DoubtDetector()
         self.doubt_filter_status: str = '全部'
         self.doubt_filter_type: str = '全部'
+        self._current_selected_doubt_id: str = ''
+        self._current_selected_citation_id: str = ''
 
         self._setup_style()
         self._build_ui()
@@ -119,6 +130,7 @@ class AncientTextCollationApp:
         self._build_doubt_detection_tab()
         self._build_review_tab()
         self._build_citation_tab()
+        self._build_case_library_tab()
         self._build_export_tab()
         self._build_audit_tab()
         self._build_stats_tab()
@@ -719,6 +731,10 @@ class AncientTextCollationApp:
         if not selection:
             return
         citation_id = self.tree_citations.item(selection[0], 'values')[0]
+        self._current_selected_citation_id = citation_id
+        self._current_selected_doubt_id = ''
+        if hasattr(self, '_load_recommendations_tree'):
+            self._load_recommendations_tree()
         if not self.current_project:
             return
         citation = self.current_project.workflow_engine.get_citation(citation_id)
@@ -915,6 +931,674 @@ class AncientTextCollationApp:
         if self.cmb_citation_copy['values']:
             self.cmb_citation_copy.current(0)
         self._load_citations_tree()
+
+    def _build_case_library_tab(self):
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="📚 校勘判例库与智能推荐")
+
+        top_frame = ttk.Frame(frame, padding=8)
+        top_frame.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(top_frame, text="📊 判例库统计", command=self._on_case_library_stats,
+                   style='Action.TButton').pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="🔄 刷新判例库", command=self._load_cases_tree).pack(side=tk.LEFT, padx=5)
+
+        filter_frame = ttk.LabelFrame(frame, text="筛选条件", padding=8)
+        filter_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=5)
+
+        ttk.Label(filter_frame, text="书名:").grid(row=0, column=0, sticky=tk.W, padx=2, pady=3)
+        self.cmb_case_book = ttk.Combobox(filter_frame, width=15, state='readonly')
+        self.cmb_case_book.grid(row=0, column=1, padx=5, pady=3)
+
+        ttk.Label(filter_frame, text="卷次:").grid(row=0, column=2, sticky=tk.W, padx=2, pady=3)
+        self.cmb_case_volume = ttk.Combobox(filter_frame, width=10, state='readonly')
+        self.cmb_case_volume.grid(row=0, column=3, padx=5, pady=3)
+
+        ttk.Label(filter_frame, text="抄本:").grid(row=0, column=4, sticky=tk.W, padx=2, pady=3)
+        self.cmb_case_copy = ttk.Combobox(filter_frame, width=10, state='readonly')
+        self.cmb_case_copy.grid(row=0, column=5, padx=5, pady=3)
+
+        ttk.Label(filter_frame, text="校勘类型:").grid(row=1, column=0, sticky=tk.W, padx=2, pady=3)
+        self.cmb_case_category = ttk.Combobox(filter_frame,
+            values=['全部'] + [c.value for c in CaseCategory], width=12, state='readonly')
+        self.cmb_case_category.current(0)
+        self.cmb_case_category.grid(row=1, column=1, padx=5, pady=3)
+
+        ttk.Label(filter_frame, text="来源类型:").grid(row=1, column=2, sticky=tk.W, padx=2, pady=3)
+        self.cmb_case_source = ttk.Combobox(filter_frame,
+            values=['全部'] + [s.value for s in CaseSourceType], width=12, state='readonly')
+        self.cmb_case_source.current(0)
+        self.cmb_case_source.grid(row=1, column=3, padx=5, pady=3)
+
+        ttk.Label(filter_frame, text="处理状态:").grid(row=1, column=4, sticky=tk.W, padx=2, pady=3)
+        self.cmb_case_status = ttk.Combobox(filter_frame,
+            values=['全部'] + [s.value for s in CaseStatus], width=10, state='readonly')
+        self.cmb_case_status.current(0)
+        self.cmb_case_status.grid(row=1, column=5, padx=5, pady=3)
+
+        ttk.Label(filter_frame, text="关键词:").grid(row=2, column=0, sticky=tk.W, padx=2, pady=3)
+        self.entry_case_keyword = ttk.Entry(filter_frame, width=25)
+        self.entry_case_keyword.grid(row=2, column=1, padx=5, pady=3, columnspan=2, sticky=tk.W)
+
+        ttk.Button(filter_frame, text="🔍 筛选", command=self._load_cases_tree).grid(
+            row=2, column=3, padx=5, pady=3)
+        ttk.Button(filter_frame, text="🔄 重置", command=self._reset_case_filter).grid(
+            row=2, column=4, padx=5, pady=3)
+
+        content_pane = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
+        content_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=5)
+
+        left_frame = ttk.Frame(content_pane)
+        content_pane.add(left_frame, weight=3)
+
+        left_label = ttk.LabelFrame(left_frame, text="判例列表", padding=5)
+        left_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        yscroll1 = ttk.Scrollbar(left_label, orient=tk.VERTICAL)
+        xscroll1 = ttk.Scrollbar(left_label, orient=tk.HORIZONTAL)
+        self.tree_cases = ttk.Treeview(left_label, yscrollcommand=yscroll1.set, xscrollcommand=xscroll1.set)
+        yscroll1.config(command=self.tree_cases.yview)
+        xscroll1.config(command=self.tree_cases.xview)
+        yscroll1.pack(side=tk.RIGHT, fill=tk.Y)
+        xscroll1.pack(side=tk.BOTTOM, fill=tk.X)
+        self.tree_cases.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.tree_cases.bind('<<TreeviewSelect>>', self._on_case_select)
+
+        cols_case = ('case_id', 'category', 'source_type', 'book_name', 'volume', 'paragraph',
+                     'copy_batch', 'original_text', 'variant_text', 'confidence', 'status',
+                     'usage_count', 'accept_count', 'created_at')
+        self.tree_cases['columns'] = cols_case
+        for col in cols_case:
+            width_map2 = {
+                'case_id': 180, 'category': 80, 'source_type': 100, 'book_name': 120,
+                'volume': 50, 'paragraph': 60, 'copy_batch': 90, 'original_text': 180,
+                'variant_text': 180, 'confidence': 70, 'status': 70, 'usage_count': 60,
+                'accept_count': 60, 'created_at': 140
+            }
+            anchor2 = tk.CENTER if col in ('volume', 'paragraph', 'confidence', 'status',
+                                            'usage_count', 'accept_count', 'created_at') else tk.W
+            self.tree_cases.heading(col, text={
+                'case_id': '判例ID', 'category': '类型', 'source_type': '来源',
+                'book_name': '书名', 'volume': '卷', 'paragraph': '段',
+                'copy_batch': '抄本', 'original_text': '原文', 'variant_text': '异文/引文',
+                'confidence': '置信度', 'status': '状态', 'usage_count': '使用',
+                'accept_count': '采纳', 'created_at': '创建时间'
+            }[col])
+            self.tree_cases.column(col, width=width_map2.get(col, 120), anchor=anchor2, stretch=True)
+        self.tree_cases['show'] = 'headings'
+
+        right_frame = ttk.Frame(content_pane)
+        content_pane.add(right_frame, weight=2)
+
+        detail_frame = ttk.LabelFrame(right_frame, text="判例详情", padding=5)
+        detail_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=2)
+
+        self.txt_case_detail = scrolledtext.ScrolledText(detail_frame, height=12, font=('SimHei', 10), wrap=tk.WORD)
+        self.txt_case_detail.pack(fill=tk.BOTH, expand=True)
+        self.txt_case_detail.config(state=tk.DISABLED)
+
+        res_frame = ttk.LabelFrame(right_frame, text="处理结论与依据", padding=5)
+        res_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=2)
+
+        self.txt_case_resolution = scrolledtext.ScrolledText(res_frame, height=10, font=('SimHei', 10), wrap=tk.WORD)
+        self.txt_case_resolution.pack(fill=tk.BOTH, expand=True)
+        self.txt_case_resolution.config(state=tk.DISABLED)
+
+        action_frame = ttk.LabelFrame(right_frame, text="操作", padding=5)
+        action_frame.pack(side=tk.TOP, fill=tk.X, pady=2)
+
+        ttk.Button(action_frame, text="📝 沉淀当前疑点为判例",
+                   command=self._on_precipitate_doubt_case).pack(side=tk.LEFT, padx=3, pady=2)
+        ttk.Button(action_frame, text="📚 沉淀当前引文为判例",
+                   command=self._on_precipitate_citation_case).pack(side=tk.LEFT, padx=3, pady=2)
+        ttk.Button(action_frame, text="🔄 重新激活判例",
+                   command=self._on_reactivate_case).pack(side=tk.LEFT, padx=3, pady=2)
+        ttk.Button(action_frame, text="❌ 使判例失效",
+                   command=self._on_invalidate_case).pack(side=tk.LEFT, padx=3, pady=2)
+
+        rec_frame = ttk.LabelFrame(frame, text="当前记录的智能推荐（选中疑点/引文后显示）", padding=8)
+        rec_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=5)
+
+        rec_top = ttk.Frame(rec_frame)
+        rec_top.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(rec_top, text="推荐状态筛选:").pack(side=tk.LEFT, padx=2)
+        self.cmb_rec_status = ttk.Combobox(rec_top,
+            values=['全部'] + [s.value for s in RecommendationStatus], width=10, state='readonly')
+        self.cmb_rec_status.current(0)
+        self.cmb_rec_status.pack(side=tk.LEFT, padx=5)
+        self.cmb_rec_status.bind('<<ComboboxSelected>>', lambda e: self._load_recommendations_tree())
+
+        ttk.Button(rec_top, text="🔮 为当前疑点生成推荐",
+                   command=self._on_gen_rec_for_doubt).pack(side=tk.LEFT, padx=10)
+        ttk.Button(rec_top, text="🔮 为当前引文生成推荐",
+                   command=self._on_gen_rec_for_citation).pack(side=tk.LEFT, padx=5)
+
+        yscroll2 = ttk.Scrollbar(rec_frame, orient=tk.VERTICAL)
+        self.tree_recommendations = ttk.Treeview(rec_frame, yscrollcommand=yscroll2.set, height=8)
+        yscroll2.config(command=self.tree_recommendations.yview)
+        yscroll2.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree_recommendations.pack(side=tk.TOP, fill=tk.X, expand=True, pady=5)
+        self.tree_recommendations.bind('<<TreeviewSelect>>', self._on_recommendation_select)
+
+        cols_rec = ('rec_id', 'case_id', 'similarity', 'reason', 'status',
+                    'created_at', 'decided_by', 'decided_at')
+        self.tree_recommendations['columns'] = cols_rec
+        for col in cols_rec:
+            width_map3 = {
+                'rec_id': 180, 'case_id': 180, 'similarity': 80, 'reason': 300,
+                'status': 80, 'created_at': 140, 'decided_by': 80, 'decided_at': 140
+            }
+            anchor3 = tk.CENTER if col in ('similarity', 'status', 'created_at', 'decided_at') else tk.W
+            self.tree_recommendations.heading(col, text={
+                'rec_id': '推荐ID', 'case_id': '关联判例', 'similarity': '相似度',
+                'reason': '推荐理由', 'status': '状态', 'created_at': '生成时间',
+                'decided_by': '处理人', 'decided_at': '处理时间'
+            }[col])
+            self.tree_recommendations.column(col, width=width_map3.get(col, 120), anchor=anchor3, stretch=True)
+        self.tree_recommendations['show'] = 'headings'
+
+        rec_action_frame = ttk.Frame(rec_frame)
+        rec_action_frame.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(rec_action_frame, text="处理备注:").pack(side=tk.LEFT, padx=2)
+        self.entry_rec_note = ttk.Entry(rec_action_frame, width=50)
+        self.entry_rec_note.pack(side=tk.LEFT, padx=5)
+        ttk.Button(rec_action_frame, text="✅ 采纳", command=self._on_accept_recommendation,
+                   style='Action.TButton').pack(side=tk.LEFT, padx=8)
+        ttk.Button(rec_action_frame, text="❌ 驳回", command=self._on_reject_recommendation).pack(side=tk.LEFT, padx=5)
+        ttk.Button(rec_action_frame, text="✏️ 修订后采纳", command=self._on_modify_recommendation).pack(side=tk.LEFT, padx=5)
+
+        self.txt_rec_detail = scrolledtext.ScrolledText(rec_frame, height=4, font=('SimHei', 10), wrap=tk.WORD)
+        self.txt_rec_detail.pack(side=tk.TOP, fill=tk.X, pady=3)
+        self.txt_rec_detail.config(state=tk.DISABLED)
+
+        self._current_selected_doubt_id = ''
+        self._current_selected_citation_id = ''
+
+    def _refresh_case_filters(self):
+        if not hasattr(self, 'cmb_case_book'):
+            return
+        book_vals = ['全部']
+        if self.analyzer:
+            book_vals = ['全部', self.analyzer.book_name]
+        self.cmb_case_book['values'] = book_vals
+        if book_vals:
+            self.cmb_case_book.current(0)
+        vols = ['全部'] + [f'第{v}卷' for v in (self.analyzer.volumes if self.analyzer else [])]
+        self.cmb_case_volume['values'] = vols
+        if vols:
+            self.cmb_case_volume.current(0)
+        copies = ['全部'] + list(self.analyzer.copy_batches if self.analyzer else [])
+        self.cmb_case_copy['values'] = copies
+        if copies:
+            self.cmb_case_copy.current(0)
+
+    def _reset_case_filter(self):
+        self._refresh_case_filters()
+        self.cmb_case_category.current(0)
+        self.cmb_case_source.current(0)
+        self.cmb_case_status.current(0)
+        self.entry_case_keyword.delete(0, tk.END)
+        self._load_cases_tree()
+
+    def _load_cases_tree(self):
+        self.tree_cases.delete(*self.tree_cases.get_children())
+        if not self.current_project:
+            return
+        try:
+            pm = self.current_project.workflow_engine.permission_manager
+            pm.set_user_role(self.current_user, self.current_role)
+            pm.check_permission(self.current_user, 'view_cases')
+        except Exception:
+            return
+
+        f = CaseFilter(project_id=self.current_project.project_id)
+
+        book_filter = self.cmb_case_book.get() if hasattr(self, 'cmb_case_book') else ''
+        if book_filter and book_filter != '全部':
+            f.book_name = book_filter
+
+        vol_filter = self.cmb_case_volume.get() if hasattr(self, 'cmb_case_volume') else ''
+        if vol_filter and vol_filter != '全部':
+            try:
+                f.volume = int(vol_filter.replace('第', '').replace('卷', ''))
+            except Exception:
+                pass
+
+        copy_filter = self.cmb_case_copy.get() if hasattr(self, 'cmb_case_copy') else ''
+        if copy_filter and copy_filter != '全部':
+            f.copy_batch = copy_filter
+
+        cat_filter = self.cmb_case_category.get() if hasattr(self, 'cmb_case_category') else ''
+        if cat_filter and cat_filter != '全部':
+            for c in CaseCategory:
+                if c.value == cat_filter:
+                    f.category = c
+                    break
+
+        src_filter = self.cmb_case_source.get() if hasattr(self, 'cmb_case_source') else ''
+        if src_filter and src_filter != '全部':
+            for s in CaseSourceType:
+                if s.value == src_filter:
+                    f.source_type = s
+                    break
+
+        status_filter = self.cmb_case_status.get() if hasattr(self, 'cmb_case_status') else ''
+        if status_filter and status_filter != '全部':
+            for s in CaseStatus:
+                if s.value == status_filter:
+                    f.status = s
+                    break
+
+        kw = self.entry_case_keyword.get().strip() if hasattr(self, 'entry_case_keyword') else ''
+        if kw:
+            f.keyword = kw
+
+        cases = self.current_project.filter_cases(f)
+
+        for c in cases:
+            display_text = c.quoted_text if (not c.variant_text and c.quoted_text) else c.variant_text
+            self.tree_cases.insert('', tk.END, values=(
+                c.case_id,
+                c.category.value,
+                c.source_type.value,
+                c.book_name,
+                c.volume or '',
+                c.paragraph or '',
+                c.copy_batch or '',
+                c.original_text,
+                display_text,
+                f"{c.confidence:.1%}",
+                c.status.value,
+                c.usage_count,
+                c.accept_count,
+                c.created_at.strftime('%Y-%m-%d %H:%M')
+            ))
+
+    def _on_case_select(self, event=None):
+        selection = self.tree_cases.selection()
+        if not selection:
+            return
+        case_id = self.tree_cases.item(selection[0], 'values')[0]
+        if not self.current_project:
+            return
+        case = self.current_project.get_case(case_id)
+        if not case:
+            return
+
+        self.txt_case_detail.config(state=tk.NORMAL)
+        self.txt_case_detail.delete('1.0', tk.END)
+        content = (f"判例ID: {case.case_id}\n"
+                   f"类型: {case.category.value}    来源: {case.source_type.value}\n"
+                   f"书名: {case.book_name}\n")
+        if case.volume:
+            content += f"卷次: 第{case.volume}卷    "
+        if case.paragraph:
+            content += f"段落: 第{case.paragraph}段    "
+        if case.copy_batch:
+            content += f"抄本: {case.copy_batch}"
+        content += f"\n置信度: {case.confidence:.2%}\n"
+        content += f"状态: {case.status.value}"
+        if case.invalidated_reason:
+            content += f"    失效原因: {case.invalidated_reason}"
+        content += f"\n原文: {case.original_text}\n"
+        if case.variant_text:
+            content += f"异文/建议: {case.variant_text}\n"
+        if case.quoted_text:
+            content += f"引文字段: {case.quoted_text}\n"
+        if case.rule_id:
+            content += f"规则ID: {case.rule_id}\n"
+        if case.description:
+            content += f"描述: {case.description}\n"
+        content += f"创建人: {case.created_by}    创建时间: {case.created_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        content += f"关联记录: {case.source_record_id or '无'}\n"
+        content += f"使用次数: {case.usage_count}    采纳次数: {case.accept_count}"
+        if case.tags:
+            content += f"\n标签: {', '.join(case.tags)}"
+        self.txt_case_detail.insert('1.0', content)
+        self.txt_case_detail.config(state=tk.DISABLED)
+
+        self.txt_case_resolution.config(state=tk.NORMAL)
+        self.txt_case_resolution.delete('1.0', tk.END)
+        if case.resolution:
+            res_content = (f"处理结论: {case.resolution.conclusion}\n\n"
+                           f"采用依据:\n{case.resolution.basis}\n")
+            if case.resolution.final_text:
+                res_content += f"\n最终文本: {case.resolution.final_text}\n"
+            if case.resolution.notes:
+                res_content += f"\n备注: {case.resolution.notes}\n"
+            if case.resolution.reference_sources:
+                res_content += f"\n参考出处 ({len(case.resolution.reference_sources)}条):\n"
+                for i, src in enumerate(case.resolution.reference_sources, 1):
+                    src_parts = [f"  {i}. 书名: {src.get('source_book', '')}"]
+                    if src.get('source_volume'):
+                        src_parts.append(f"卷{src['source_volume']}")
+                    if src.get('source_paragraph'):
+                        src_parts.append(f"段{src['source_paragraph']}")
+                    if src.get('source_chapter'):
+                        src_parts.append(f"章节: {src['source_chapter']}")
+                    if src.get('source_page'):
+                        src_parts.append(f"页码: {src['source_page']}")
+                    res_content += '  ' + ' '.join(src_parts) + '\n'
+                    if src.get('source_text'):
+                        res_content += f"     原文: {src['source_text'][:100]}\n"
+            self.txt_case_resolution.insert('1.0', res_content)
+        else:
+            self.txt_case_resolution.insert('1.0', '此判例暂无处理结论信息')
+        self.txt_case_resolution.config(state=tk.DISABLED)
+
+    def _on_case_library_stats(self):
+        if not self.current_project:
+            messagebox.showinfo("提示", "请先选择项目")
+            return
+        stats = self.current_project.get_case_statistics()
+        msg = "校勘判例库统计\n\n"
+        msg += f"判例总数: {stats.get('total_cases', 0)}\n"
+        msg += f"  有效判例: {stats.get('active_cases', 0)}\n"
+        msg += f"  已失效: {stats.get('invalidated_cases', 0)}\n"
+        msg += f"  已归档: {stats.get('archived_cases', 0)}\n\n"
+        msg += f"推荐总数: {stats.get('total_recommendations', 0)}\n"
+        msg += f"  待处理: {stats.get('pending_recommendations', 0)}\n"
+        msg += f"  已采纳: {stats.get('accepted_recommendations', 0)}\n"
+        msg += f"  已驳回: {stats.get('rejected_recommendations', 0)}\n"
+        msg += f"  已修订: {stats.get('modified_recommendations', 0)}\n"
+        msg += f"  已失效: {stats.get('invalidated_recommendations', 0)}\n"
+        ar = stats.get('accept_rate', 0.0)
+        msg += f"  采纳率: {ar:.1%}\n\n"
+        msg += "按来源统计:\n"
+        for k, v in stats.get('by_source_type', {}).items():
+            msg += f"  {k}: {v}\n"
+        msg += "\n按类型统计:\n"
+        for k, v in stats.get('by_category', {}).items():
+            msg += f"  {k}: {v}\n"
+        messagebox.showinfo("判例库统计", msg)
+
+    def _on_precipitate_doubt_case(self):
+        if not self.current_project:
+            messagebox.showinfo("提示", "请先选择项目")
+            return
+        doubt_id = getattr(self, '_current_selected_doubt_id', '')
+        if not doubt_id:
+            messagebox.showinfo("提示", "请先在【人工复核工作流】Tab中选中一个疑点")
+            return
+        try:
+            case = self.current_project.create_case_from_doubt(
+                self.current_user, doubt_id, extra_notes='人工沉淀'
+            )
+            self.lbl_status.config(text=f"已沉淀判例: {case.case_id}")
+            messagebox.showinfo("成功", f"已成功将疑点沉淀为判例:\n{case.case_id}")
+            self._load_cases_tree()
+        except Exception as e:
+            messagebox.showerror("失败", str(e))
+
+    def _on_precipitate_citation_case(self):
+        if not self.current_project:
+            messagebox.showinfo("提示", "请先选择项目")
+            return
+        citation_id = getattr(self, '_current_selected_citation_id', '')
+        if not citation_id:
+            messagebox.showinfo("提示", "请先在【引文溯源与互证分析】Tab中选中一条引文")
+            return
+        try:
+            case = self.current_project.create_case_from_citation(
+                self.current_user, citation_id, extra_notes='人工沉淀'
+            )
+            self.lbl_status.config(text=f"已沉淀判例: {case.case_id}")
+            messagebox.showinfo("成功", f"已成功将引文沉淀为判例:\n{case.case_id}")
+            self._load_cases_tree()
+        except Exception as e:
+            messagebox.showerror("失败", str(e))
+
+    def _on_reactivate_case(self):
+        selection = self.tree_cases.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先选择一个判例")
+            return
+        case_id = self.tree_cases.item(selection[0], 'values')[0]
+        try:
+            self.current_project.reactivate_case(self.current_user, case_id)
+            self.lbl_status.config(text=f"已重新激活判例: {case_id}")
+            self._load_cases_tree()
+            self._on_case_select()
+        except Exception as e:
+            messagebox.showerror("失败", str(e))
+
+    def _on_invalidate_case(self):
+        selection = self.tree_cases.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先选择一个判例")
+            return
+        case_id = self.tree_cases.item(selection[0], 'values')[0]
+        reason = ''
+        win = tk.Toplevel(self.root)
+        win.title("失效原因")
+        win.geometry("400x180")
+        win.transient(self.root)
+        win.grab_set()
+        ttk.Label(win, text="请输入失效原因:", style='Subtitle.TLabel').pack(pady=10)
+        entry_reason = ttk.Entry(win, width=40)
+        entry_reason.pack(pady=5)
+
+        def do_invalidate():
+            nonlocal reason
+            reason = entry_reason.get().strip() or '人工操作失效'
+            try:
+                self.current_project.invalidate_case(self.current_user, case_id, reason)
+                self.lbl_status.config(text=f"已使判例失效: {case_id}")
+                win.destroy()
+                self._load_cases_tree()
+                self._on_case_select()
+            except Exception as e:
+                messagebox.showerror("失败", str(e))
+
+        ttk.Button(win, text="确认失效", command=do_invalidate, style='Action.TButton').pack(pady=15)
+
+    def _on_gen_rec_for_doubt(self):
+        if not self.current_project:
+            messagebox.showinfo("提示", "请先选择项目")
+            return
+        doubt_id = getattr(self, '_current_selected_doubt_id', '')
+        if not doubt_id:
+            messagebox.showinfo("提示", "请先在【人工复核工作流】Tab中选中一个疑点")
+            return
+        try:
+            recs = self.current_project.generate_recommendations_for_doubt(
+                self.current_user, doubt_id, top_k=5
+            )
+            self.lbl_status.config(text=f"为疑点{doubt_id}生成了{len(recs)}条推荐")
+            messagebox.showinfo("完成", f"已为疑点{doubt_id}生成{len(recs)}条智能推荐")
+            self._load_recommendations_tree()
+        except Exception as e:
+            messagebox.showerror("失败", str(e))
+
+    def _on_gen_rec_for_citation(self):
+        if not self.current_project:
+            messagebox.showinfo("提示", "请先选择项目")
+            return
+        citation_id = getattr(self, '_current_selected_citation_id', '')
+        if not citation_id:
+            messagebox.showinfo("提示", "请先在【引文溯源与互证分析】Tab中选中一条引文")
+            return
+        try:
+            recs = self.current_project.generate_recommendations_for_citation(
+                self.current_user, citation_id, top_k=5
+            )
+            self.lbl_status.config(text=f"为引文{citation_id}生成了{len(recs)}条推荐")
+            messagebox.showinfo("完成", f"已为引文{citation_id}生成{len(recs)}条智能推荐")
+            self._load_recommendations_tree()
+        except Exception as e:
+            messagebox.showerror("失败", str(e))
+
+    def _load_recommendations_tree(self):
+        self.tree_recommendations.delete(*self.tree_recommendations.get_children())
+        if not self.current_project:
+            return
+        try:
+            pm = self.current_project.workflow_engine.permission_manager
+            pm.set_user_role(self.current_user, self.current_role)
+            pm.check_permission(self.current_user, 'view_recommendations')
+        except Exception:
+            return
+
+        target_id = getattr(self, '_current_selected_doubt_id', '') or getattr(self, '_current_selected_citation_id', '')
+        if not target_id:
+            return
+
+        status_val = None
+        status_filter = self.cmb_rec_status.get() if hasattr(self, 'cmb_rec_status') else ''
+        if status_filter and status_filter != '全部':
+            for s in RecommendationStatus:
+                if s.value == status_filter:
+                    status_val = s
+                    break
+
+        recs = self.current_project.get_recommendations_for_target(target_id, status=status_val)
+        for r in recs:
+            self.tree_recommendations.insert('', tk.END, values=(
+                r.recommendation_id,
+                r.case_id,
+                f"{r.similarity.overall:.2%}",
+                r.reason,
+                r.status.value,
+                r.created_at.strftime('%Y-%m-%d %H:%M'),
+                r.decided_by or '-',
+                r.decided_at.strftime('%Y-%m-%d %H:%M') if r.decided_at else '-'
+            ))
+
+    def _on_recommendation_select(self, event=None):
+        selection = self.tree_recommendations.selection()
+        if not selection or not self.current_project:
+            return
+        rec_id = self.tree_recommendations.item(selection[0], 'values')[0]
+        rec = self.current_project.workflow_engine.get_recommendation(rec_id)
+        if not rec:
+            return
+        case = self.current_project.get_case(rec.case_id)
+
+        self.txt_rec_detail.config(state=tk.NORMAL)
+        self.txt_rec_detail.delete('1.0', tk.END)
+        content = f"推荐ID: {rec.recommendation_id}\n"
+        content += f"关联判例: {rec.case_id}\n"
+        sim = rec.similarity
+        content += (f"相似度分解: 综合{sim.overall:.2%} = 文本{sim.text_similarity:.0%}×40% + "
+                   f"类型{sim.category_match:.0%}×20% + 同书{sim.book_match:.0%}×15% + "
+                   f"卷次{sim.volume_proximity:.0%}×10% + 来源{sim.source_type_match:.0%}×10% + 规则{sim.rule_match:.0%}×5%\n")
+        content += f"推荐理由: {rec.reason}\n"
+        if case and case.resolution:
+            content += f"\n【判例处理结论】{case.resolution.conclusion}\n"
+            content += f"【采用依据】{case.resolution.basis}\n"
+            if case.resolution.final_text:
+                content += f"【建议最终文本】{case.resolution.final_text}\n"
+            if case.resolution.reference_sources:
+                content += f"【参考出处】{len(case.resolution.reference_sources)}条\n"
+        if rec.operation_history:
+            content += "\n操作历史:\n"
+            for h in rec.operation_history:
+                content += f"  {h.get('timestamp', '')} {h.get('operator', '')}[{h.get('operator_role', '')}] {h.get('action', '')}: {h.get('content', '')}\n"
+        if rec.invalidated_reason:
+            content += f"\n失效原因: {rec.invalidated_reason}"
+        self.txt_rec_detail.insert('1.0', content)
+        self.txt_rec_detail.config(state=tk.DISABLED)
+
+    def _on_accept_recommendation(self):
+        selection = self.tree_recommendations.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先选择一条推荐")
+            return
+        rec_id = self.tree_recommendations.item(selection[0], 'values')[0]
+        note = self.entry_rec_note.get().strip()
+        try:
+            self.current_project.accept_recommendation(self.current_user, rec_id, note)
+            self.lbl_status.config(text=f"已采纳推荐: {rec_id}")
+            self.entry_rec_note.delete(0, tk.END)
+            self._load_recommendations_tree()
+            self._on_recommendation_select()
+            self._load_cases_tree()
+        except Exception as e:
+            messagebox.showerror("失败", str(e))
+
+    def _on_reject_recommendation(self):
+        selection = self.tree_recommendations.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先选择一条推荐")
+            return
+        rec_id = self.tree_recommendations.item(selection[0], 'values')[0]
+        reason = self.entry_rec_note.get().strip()
+        try:
+            self.current_project.reject_recommendation(self.current_user, rec_id, reason)
+            self.lbl_status.config(text=f"已驳回推荐: {rec_id}")
+            self.entry_rec_note.delete(0, tk.END)
+            self._load_recommendations_tree()
+            self._on_recommendation_select()
+            self._load_cases_tree()
+        except Exception as e:
+            messagebox.showerror("失败", str(e))
+
+    def _on_modify_recommendation(self):
+        selection = self.tree_recommendations.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先选择一条推荐")
+            return
+        rec_id = self.tree_recommendations.item(selection[0], 'values')[0]
+        case_id = self.tree_recommendations.item(selection[0], 'values')[1]
+        case = self.current_project.get_case(case_id) if self.current_project else None
+        if not case:
+            messagebox.showerror("错误", "关联判例不存在")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("修订推荐内容")
+        win.geometry("550x450")
+        win.transient(self.root)
+        win.grab_set()
+
+        ttk.Label(win, text="处理结论:", style='Subtitle.TLabel').grid(row=0, column=0, sticky=tk.NW, padx=10, pady=8)
+        txt_conclusion = scrolledtext.ScrolledText(win, width=50, height=3)
+        txt_conclusion.grid(row=0, column=1, padx=10, pady=8)
+        if case.resolution:
+            txt_conclusion.insert('1.0', case.resolution.conclusion)
+
+        ttk.Label(win, text="采用依据:", style='Subtitle.TLabel').grid(row=1, column=0, sticky=tk.NW, padx=10, pady=8)
+        txt_basis = scrolledtext.ScrolledText(win, width=50, height=4)
+        txt_basis.grid(row=1, column=1, padx=10, pady=8)
+        if case.resolution:
+            txt_basis.insert('1.0', case.resolution.basis)
+
+        ttk.Label(win, text="建议最终文本:", style='Subtitle.TLabel').grid(row=2, column=0, sticky=tk.NW, padx=10, pady=8)
+        txt_final = scrolledtext.ScrolledText(win, width=50, height=3)
+        txt_final.grid(row=2, column=1, padx=10, pady=8)
+        if case.resolution:
+            txt_final.insert('1.0', case.resolution.final_text)
+
+        ttk.Label(win, text="备注说明:", style='Subtitle.TLabel').grid(row=3, column=0, sticky=tk.NW, padx=10, pady=8)
+        txt_note = scrolledtext.ScrolledText(win, width=50, height=3)
+        txt_note.grid(row=3, column=1, padx=10, pady=8)
+
+        def do_modify():
+            modified = {
+                'conclusion': txt_conclusion.get('1.0', tk.END).strip(),
+                'basis': txt_basis.get('1.0', tk.END).strip(),
+                'final_text': txt_final.get('1.0', tk.END).strip(),
+                'note': txt_note.get('1.0', tk.END).strip()
+            }
+            try:
+                self.current_project.modify_recommendation(
+                    self.current_user, rec_id, modified,
+                    note=txt_note.get('1.0', tk.END).strip()
+                )
+                self.lbl_status.config(text=f"已修订并采纳推荐: {rec_id}")
+                win.destroy()
+                self._load_recommendations_tree()
+                self._on_recommendation_select()
+                self._load_cases_tree()
+            except Exception as e:
+                messagebox.showerror("失败", str(e))
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=15)
+        ttk.Button(btn_frame, text="确认修订并采纳", command=do_modify, style='Action.TButton').pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=10)
 
     def _load_citations_tree(self):
         self.tree_citations.delete(*self.tree_citations.get_children())
@@ -1559,6 +2243,10 @@ class AncientTextCollationApp:
         if not selection:
             return
         doubt_id = self.tree_doubts.item(selection[0], 'values')[0]
+        self._current_selected_doubt_id = doubt_id
+        self._current_selected_citation_id = ''
+        if hasattr(self, '_load_recommendations_tree'):
+            self._load_recommendations_tree()
         doubt = self.current_project.workflow_engine.get_doubt(doubt_id)
         if not doubt:
             return
@@ -1584,6 +2272,10 @@ class AncientTextCollationApp:
         if not selection:
             return
         doubt_id = self.tree_review.item(selection[0], 'values')[0]
+        self._current_selected_doubt_id = doubt_id
+        self._current_selected_citation_id = ''
+        if hasattr(self, '_load_recommendations_tree'):
+            self._load_recommendations_tree()
         doubt = self.current_project.workflow_engine.get_doubt(doubt_id)
         if not doubt:
             return
@@ -1980,6 +2672,9 @@ class AncientTextCollationApp:
         self._load_review_tree()
         self._load_citations_tree()
         self._refresh_citation_filters()
+        self._refresh_case_filters()
+        self._load_cases_tree()
+        self._load_recommendations_tree()
         self._load_comparison_tree()
         self._load_missing_info()
         self._load_stats_charts()

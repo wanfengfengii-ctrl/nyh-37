@@ -272,6 +272,41 @@ class PermissionManager:
             description='导出引文溯源数据',
             roles={Role.ADMIN, Role.COLLATOR, Role.REVIEWER}
         ))
+        self.add_permission(Permission(
+            name='view_cases',
+            description='查看校勘判例库',
+            roles={Role.ADMIN, Role.COLLATOR, Role.REVIEWER, Role.GUEST}
+        ))
+        self.add_permission(Permission(
+            name='create_case',
+            description='创建/沉淀校勘判例',
+            roles={Role.ADMIN, Role.REVIEWER}
+        ))
+        self.add_permission(Permission(
+            name='edit_case',
+            description='编辑校勘判例',
+            roles={Role.ADMIN, Role.REVIEWER}
+        ))
+        self.add_permission(Permission(
+            name='invalidate_case',
+            description='使校勘判例失效',
+            roles={Role.ADMIN, Role.REVIEWER}
+        ))
+        self.add_permission(Permission(
+            name='view_recommendations',
+            description='查看智能推荐',
+            roles={Role.ADMIN, Role.COLLATOR, Role.REVIEWER}
+        ))
+        self.add_permission(Permission(
+            name='decide_recommendation',
+            description='采纳/驳回/修订推荐结果',
+            roles={Role.ADMIN, Role.REVIEWER}
+        ))
+        self.add_permission(Permission(
+            name='generate_recommendations',
+            description='生成智能推荐',
+            roles={Role.ADMIN, Role.COLLATOR, Role.REVIEWER}
+        ))
 
     def add_permission(self, permission: Permission):
         self._permissions[permission.name] = permission
@@ -302,6 +337,7 @@ class PermissionManager:
 
 class WorkflowEngine:
     def __init__(self, audit_trail: Optional[AuditTrail] = None):
+        from case_library import CaseLibrary
         self.audit_trail = audit_trail or AuditTrail()
         self.permission_manager = PermissionManager()
         self._doubts: Dict[str, DoubtRecord] = {}
@@ -311,6 +347,7 @@ class WorkflowEngine:
         self._citations: Dict[str, Any] = {}
         self._citation_unique_keys: Set[str] = set()
         self._citation_counter = 0
+        self.case_library: CaseLibrary = CaseLibrary()
 
     def _generate_doubt_id(self, project_id: str) -> str:
         self._doubt_counter += 1
@@ -894,3 +931,271 @@ class WorkflowEngine:
             if c.citation_type == CitationType.MISQUOTE:
                 stats['misquote_count'] += 1
         return stats
+
+    def create_case_from_doubt(self, operator: str, doubt_id: str,
+                               book_name: str,
+                               resolution: Optional[Any] = None,
+                               extra_notes: str = '') -> Any:
+        from audit_trail import OperationType
+        from case_library import CaseResolution
+        self.permission_manager.check_permission(operator, 'create_case')
+        doubt = self.get_doubt(doubt_id)
+        if not doubt:
+            raise ValueError(f"疑点不存在: {doubt_id}")
+        case = self.case_library.create_case_from_doubt(
+            doubt_record=doubt,
+            book_name=book_name,
+            created_by=operator,
+            resolution=resolution,
+            extra_notes=extra_notes
+        )
+        self.audit_trail.log(
+            operation_type=OperationType.CASE_CREATE,
+            operator=operator,
+            operator_role=self.permission_manager.get_user_role(operator).value,
+            project_id=case.project_id,
+            target_id=case.case_id,
+            target_type='CollationCase',
+            description=f"从疑点{doubt_id}沉淀判例【{case.category.value}】",
+            new_value=case.to_dict()
+        )
+        return case
+
+    def create_case_from_citation(self, operator: str, citation_id: str,
+                                   book_name: str,
+                                   resolution: Optional[Any] = None,
+                                   extra_notes: str = '') -> Any:
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'create_case')
+        citation = self.get_citation(citation_id)
+        if not citation:
+            raise ValueError(f"引文记录不存在: {citation_id}")
+        case = self.case_library.create_case_from_citation(
+            citation_record=citation,
+            book_name=book_name,
+            created_by=operator,
+            resolution=resolution,
+            extra_notes=extra_notes
+        )
+        self.audit_trail.log(
+            operation_type=OperationType.CASE_CREATE,
+            operator=operator,
+            operator_role=self.permission_manager.get_user_role(operator).value,
+            project_id=case.project_id,
+            target_id=case.case_id,
+            target_type='CollationCase',
+            description=f"从引文{citation_id}沉淀判例【{case.category.value}】",
+            new_value=case.to_dict()
+        )
+        return case
+
+    def get_case(self, case_id: str) -> Optional[Any]:
+        return self.case_library.get_case(case_id)
+
+    def get_all_cases(self, project_id: Optional[str] = None) -> List[Any]:
+        return self.case_library.get_all_cases(project_id)
+
+    def filter_cases(self, case_filter: Any) -> List[Any]:
+        return self.case_library.filter_cases(case_filter)
+
+    def get_cases_by_book(self, book_name: str, project_id: Optional[str] = None) -> List[Any]:
+        cases = self.get_all_cases(project_id)
+        return [c for c in cases if c.book_name == book_name]
+
+    def update_case(self, operator: str, case_id: str, **kwargs) -> Optional[Any]:
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'edit_case')
+        old_case = self.case_library.get_case(case_id)
+        if not old_case:
+            return None
+        old_values = {k: getattr(old_case, k) for k in kwargs.keys() if hasattr(old_case, k)}
+        case = self.case_library.update_case(case_id, operator, **kwargs)
+        if case:
+            self.audit_trail.log(
+                operation_type=OperationType.CASE_UPDATE,
+                operator=operator,
+                operator_role=self.permission_manager.get_user_role(operator).value,
+                project_id=case.project_id,
+                target_id=case_id,
+                target_type='CollationCase',
+                description=f"更新判例信息: {list(kwargs.keys())}",
+                old_value=old_values,
+                new_value=kwargs
+            )
+        return case
+
+    def invalidate_case(self, operator: str, case_id: str,
+                         reason: str = '关联数据已修改') -> Optional[Any]:
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'invalidate_case')
+        case = self.case_library.invalidate_case(case_id, operator, reason)
+        if case:
+            self.audit_trail.log(
+                operation_type=OperationType.CASE_INVALIDATE,
+                operator=operator,
+                operator_role=self.permission_manager.get_user_role(operator).value,
+                project_id=case.project_id,
+                target_id=case_id,
+                target_type='CollationCase',
+                description=f"判例失效: {reason}",
+                old_value={'status': '有效'},
+                new_value={'status': '已失效'}
+            )
+        return case
+
+    def reactivate_case(self, operator: str, case_id: str) -> Optional[Any]:
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'edit_case')
+        case = self.case_library.reactivate_case(case_id, operator)
+        if case:
+            self.audit_trail.log(
+                operation_type=OperationType.CASE_REACTIVATE,
+                operator=operator,
+                operator_role=self.permission_manager.get_user_role(operator).value,
+                project_id=case.project_id,
+                target_id=case_id,
+                target_type='CollationCase',
+                description="重新激活已失效判例"
+            )
+        return case
+
+    def generate_recommendations_for_doubt(self, operator: str, doubt_id: str,
+                                            book_name: str, top_k: int = 5) -> List[Any]:
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'generate_recommendations')
+        doubt = self.get_doubt(doubt_id)
+        if not doubt:
+            raise ValueError(f"疑点不存在: {doubt_id}")
+        self.case_library.invalidate_recommendations_for_target(
+            doubt_id, '原始疑点记录已变更，重新生成推荐'
+        )
+        recs = self.case_library.generate_recommendations_for_doubt(doubt, book_name, top_k)
+        for rec in recs:
+            self.audit_trail.log(
+                operation_type=OperationType.RECOMMENDATION_GENERATE,
+                operator=operator,
+                operator_role=self.permission_manager.get_user_role(operator).value,
+                project_id=rec.project_id,
+                target_id=rec.recommendation_id,
+                target_type='CaseRecommendation',
+                description=f"为疑点{doubt_id}生成判例推荐: 判例{rec.case_id}，相似度{rec.similarity.overall:.2%}",
+                new_value=rec.to_dict()
+            )
+        return recs
+
+    def generate_recommendations_for_citation(self, operator: str, citation_id: str,
+                                               book_name: str, top_k: int = 5) -> List[Any]:
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'generate_recommendations')
+        citation = self.get_citation(citation_id)
+        if not citation:
+            raise ValueError(f"引文记录不存在: {citation_id}")
+        self.case_library.invalidate_recommendations_for_target(
+            citation_id, '原始引文记录已变更，重新生成推荐'
+        )
+        recs = self.case_library.generate_recommendations_for_citation(citation, book_name, top_k)
+        for rec in recs:
+            self.audit_trail.log(
+                operation_type=OperationType.RECOMMENDATION_GENERATE,
+                operator=operator,
+                operator_role=self.permission_manager.get_user_role(operator).value,
+                project_id=rec.project_id,
+                target_id=rec.recommendation_id,
+                target_type='CaseRecommendation',
+                description=f"为引文{citation_id}生成判例推荐: 判例{rec.case_id}，相似度{rec.similarity.overall:.2%}",
+                new_value=rec.to_dict()
+            )
+        return recs
+
+    def get_recommendations_for_target(self, target_record_id: str,
+                                        target_record_type: Optional[str] = None,
+                                        status: Optional[Any] = None) -> List[Any]:
+        return self.case_library.get_recommendations_for_target(
+            target_record_id, target_record_type, status
+        )
+
+    def get_all_recommendations(self, project_id: Optional[str] = None) -> List[Any]:
+        return self.case_library.get_all_recommendations(project_id)
+
+    def filter_recommendations(self, rec_filter: Any) -> List[Any]:
+        return self.case_library.filter_recommendations(rec_filter)
+
+    def accept_recommendation(self, operator: str, rec_id: str,
+                               note: str = '') -> Optional[Any]:
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'decide_recommendation')
+        rec = self.case_library.accept_recommendation(
+            rec_id, operator,
+            self.permission_manager.get_user_role(operator).value, note
+        )
+        if rec:
+            self.audit_trail.log(
+                operation_type=OperationType.RECOMMENDATION_ACCEPT,
+                operator=operator,
+                operator_role=self.permission_manager.get_user_role(operator).value,
+                project_id=rec.project_id,
+                target_id=rec_id,
+                target_type='CaseRecommendation',
+                description=f"采纳推荐{rec_id}: {note or '无备注'}",
+                old_value={'status': '待处理'},
+                new_value={'status': '已采纳'}
+            )
+        return rec
+
+    def reject_recommendation(self, operator: str, rec_id: str,
+                               reason: str = '') -> Optional[Any]:
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'decide_recommendation')
+        rec = self.case_library.reject_recommendation(
+            rec_id, operator,
+            self.permission_manager.get_user_role(operator).value, reason
+        )
+        if rec:
+            self.audit_trail.log(
+                operation_type=OperationType.RECOMMENDATION_REJECT,
+                operator=operator,
+                operator_role=self.permission_manager.get_user_role(operator).value,
+                project_id=rec.project_id,
+                target_id=rec_id,
+                target_type='CaseRecommendation',
+                description=f"驳回推荐{rec_id}: {reason or '无理由'}",
+                old_value={'status': '待处理'},
+                new_value={'status': '已驳回'}
+            )
+        return rec
+
+    def modify_recommendation(self, operator: str, rec_id: str,
+                               modified: Dict[str, Any],
+                               note: str = '') -> Optional[Any]:
+        from audit_trail import OperationType
+        self.permission_manager.check_permission(operator, 'decide_recommendation')
+        rec = self.case_library.modify_recommendation(
+            rec_id, operator, modified,
+            self.permission_manager.get_user_role(operator).value, note
+        )
+        if rec:
+            self.audit_trail.log(
+                operation_type=OperationType.RECOMMENDATION_MODIFY,
+                operator=operator,
+                operator_role=self.permission_manager.get_user_role(operator).value,
+                project_id=rec.project_id,
+                target_id=rec_id,
+                target_type='CaseRecommendation',
+                description=f"修订后采纳推荐{rec_id}: {note or '无备注'}",
+                old_value={'status': '待处理'},
+                new_value={'status': '已修订', 'modified': modified}
+            )
+        return rec
+
+    def get_case_statistics(self, project_id: Optional[str] = None) -> Dict[str, Any]:
+        return self.case_library.get_statistics(project_id)
+
+    def clear(self):
+        self._doubts.clear()
+        self._unique_keys.clear()
+        self._comment_counter = 0
+        self._doubt_counter = 0
+        self._citations.clear()
+        self._citation_unique_keys.clear()
+        self._citation_counter = 0
+        self.case_library.clear()
