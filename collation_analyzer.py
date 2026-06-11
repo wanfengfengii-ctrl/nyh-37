@@ -33,27 +33,56 @@ class CollationAnalyzer:
         self._comparison_table = None
         self._diff_matrix = None
 
-    def update_record(self, index: int, column: str, value) -> bool:
+    def update_record(self, index: int, column: str, value) -> (bool, str):
+        """
+        更新记录
+        Returns: (是否成功, 错误信息)  成功时错误信息为空字符串
+        """
         if index < 0 or index >= len(self.df):
-            return False
+            return False, "行索引越界"
         if column not in self.df.columns:
-            return False
+            return False, f"列名【{column}】不存在"
 
+        new_val = value
         if column in ['卷次', '段落编号']:
             try:
-                val = int(value)
+                val = int(str(value).strip())
                 if val <= 0:
-                    return False
+                    return False, f"【{column}】必须为正整数，当前值: {value}"
+                new_val = val
             except (ValueError, TypeError):
-                return False
-            self.df.at[index, column] = val
+                return False, f"【{column}】格式错误，不是有效正整数: {value}"
         else:
-            self.df.at[index, column] = str(value)
+            new_val = str(value).strip()
+            if not new_val and column in ['书名', '抄本批次', '原文内容']:
+                return False, f"【{column}】不能为空"
 
+        if column == '书名':
+            if new_val != self.book_name:
+                return False, (f"不同书目的数据不能直接合并比较：不能将书名从"
+                               f"「{self.book_name}」改为「{new_val}」")
+
+        after_change = self.df.iloc[index].copy()
+        after_change[column] = new_val
+
+        if column in ['卷次', '段落编号', '抄本批次']:
+            check_copy = after_change['抄本批次']
+            check_vol = int(after_change['卷次'])
+            check_para = int(after_change['段落编号'])
+            duplicates = self.df[
+                (self.df['抄本批次'] == check_copy) &
+                (self.df['卷次'] == check_vol) &
+                (self.df['段落编号'] == check_para)
+            ]
+            if len(duplicates) > 1 or (len(duplicates) == 1 and duplicates.index[0] != index):
+                return False, (f"同一抄本（{check_copy}）同一卷次（第{check_vol}卷）内"
+                               f"段落编号（{check_para}）已存在，不允许重复")
+
+        self.df.at[index, column] = new_val
         self.copy_batches = sorted(self.df['抄本批次'].unique().tolist())
         self.volumes = sorted(self.df['卷次'].unique().tolist())
         self.invalidate_stats()
-        return True
+        return True, ""
 
     def delete_record(self, index: int) -> bool:
         if index < 0 or index >= len(self.df):

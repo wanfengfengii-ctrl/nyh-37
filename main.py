@@ -176,8 +176,8 @@ class AncientTextCollationApp:
 
         ttk.Label(btn_frame, text="选中行后双击单元格可编辑：").pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="删除选中行", command=self._delete_selected_row).pack(side=tk.LEFT, padx=10)
-        ttk.Label(btn_frame, text="（修改后需点击上方【重新计算】按钮刷新异文统计）",
-                  foreground='#888').pack(side=tk.LEFT, padx=10)
+        ttk.Label(btn_frame, text="（修改后异文统计会自动重新计算）",
+                  foreground='#2E8B57').pack(side=tk.LEFT, padx=10)
 
         tree_frame = ttk.Frame(frame)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=5)
@@ -310,14 +310,23 @@ class AncientTextCollationApp:
 
         def save_edit(e=None):
             new_val = entry.get().strip()
-            entry.destroy()
             data_idx = int(self.tree_raw_data.item(row_id, 'tags')[0])
-            if self.analyzer.update_record(data_idx, col_name, new_val):
+            success, err_msg = self.analyzer.update_record(data_idx, col_name, new_val)
+            if success:
+                entry.destroy()
                 self.tree_raw_data.set(row_id, col_name, self.analyzer.df.iloc[data_idx][col_name])
-                self.lbl_status.config(text=f"已修改行{data_idx + 2}的【{col_name}】，请点击【重新计算】刷新统计")
+                self.lbl_status.config(text=f"已修改行{data_idx + 2}的【{col_name}】，统计结果已自动刷新")
+                self._load_comparison_tree()
+                self._load_missing_info()
+                self._load_stats_charts()
+                self._load_heatmaps()
+                self._load_raw_data_tree()
+                self._update_counts_label()
+            else:
+                entry.focus_set()
+                messagebox.showerror("修改失败", err_msg, parent=self.root)
 
         entry.bind('<Return>', save_edit)
-        entry.bind('<FocusOut>', save_edit)
         entry.bind('<Escape>', lambda e: entry.destroy())
 
     def _delete_selected_row(self):
@@ -327,13 +336,13 @@ class AncientTextCollationApp:
         if not items:
             messagebox.showinfo("提示", "请先选择要删除的行")
             return
-        if not messagebox.askyesno("确认删除", f"确定删除选中的 {len(items)} 条记录吗？\n删除后请点击【重新计算】刷新统计。"):
+        if not messagebox.askyesno("确认删除", f"确定删除选中的 {len(items)} 条记录吗？"):
             return
         indices = sorted([int(self.tree_raw_data.item(i, 'tags')[0]) for i in items], reverse=True)
         for idx in indices:
             self.analyzer.delete_record(idx)
-        self.lbl_status.config(text="已删除记录，请点击【重新计算】刷新统计")
-        self._load_raw_data_tree()
+        self.lbl_status.config(text=f"已删除{len(indices)}条记录，统计结果已自动刷新")
+        self._refresh_all()
 
     # ---------- 刷新与渲染 ----------
 

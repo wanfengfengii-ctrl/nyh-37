@@ -127,8 +127,10 @@ def run_tests():
     try:
         old_count = len(analyzer.build_comparison_table()[analyzer.build_comparison_table()['异文'] == '有'])
         print(f"修改前异文段落数: {old_count}")
-        success = analyzer.update_record(0, '原文内容', '修改后的测试内容xxx')
+        success, err_msg = analyzer.update_record(0, '原文内容', '修改后的测试内容xxx')
         print(f"✓ 更新记录成功: {success}")
+        if not success:
+            print(f"  错误信息: {err_msg}")
         new_count = len(analyzer.build_comparison_table()[analyzer.build_comparison_table()['异文'] == '有'])
         print(f"修改后异文段落数: {new_count}")
         assert new_count >= old_count, "修改后异文数量应变化"
